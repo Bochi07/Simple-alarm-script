@@ -59,7 +59,6 @@ monitor-agent 是一套**单进程常驻**的监控告警中间件，适合部�
 - **运行日志默认落盘**：状态目录 `monitor-agent.log` 自动轮转；
 - **开机自启**：systemd 单元以 root 运行，无需占用终端（`install.sh systemd` 一条命令搞定）；
 - **自检工具**：`python3 main.py --selftest` 部署前体检配置与运行环境。
-- **内置测试**：`bash install.sh test` 运行全套回归用例（无需 root）。
 
 ---
 
@@ -491,15 +490,6 @@ sudo bash /home/king/monitor-agent/install.sh systemd
 sudo bash /home/king/monitor-agent/install.sh systemd-remove   # 只停服务
 sudo bash /home/king/monitor-agent/install.sh uninstall        # 连程序文件一起删
 ```
-
-### 9.5 回归测试
-
-```bash
-bash /home/king/monitor-agent/install.sh test
-```
-
-运行 `tests/run_tests.py` 全部用例（无需 root、不触发真实钉钉推送），
-覆盖：阈值/冷却、SKIP 通知、恢复通知、状态持久化、日志语义监控。
 
 ### 9.5 告警风暴治理
 

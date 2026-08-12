@@ -123,12 +123,6 @@ journalctl -u monitor-agent -f
 注意：读取 `/var/log/nginx/error.log` 与 `/var/run/docker.sock` 需要 root 权限，
 服务以 `User=root` 运行；卸载自启用 `sudo bash install.sh systemd-remove`。
 
-升级后跑一遍内置回归测试（无需 root）：
-
-```bash
-bash /home/king/monitor-agent/install.sh test
-```
-
 ## 设计要点
 
 - **单实例锁**：PID 文件 + 存活检测，防止重复启动造成重复告警；

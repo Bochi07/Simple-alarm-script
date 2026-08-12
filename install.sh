@@ -7,7 +7,6 @@
 #   sudo bash install.sh systemd         # 安装文件 + 注册 systemd 开机自启并立即启动
 #   sudo bash install.sh systemd-remove  # 停止并移除 systemd 服务（保留程序文件）
 #   sudo bash install.sh uninstall       # 完全卸载（停止服务 + 删除已安装文件，备份保留）
-#   bash install.sh test                 # 运行内置测试（无需 root）
 #
 # 行为：
 #   1. 备份 /usr/local/bin/test/test 下现有文件到 test.bak-<时间戳>
@@ -52,8 +51,6 @@ install_files() {
     cp -p "$SRC"/requirements.txt "$SRC"/config.example.json "$DST"/
     mkdir -p "$DST"/deploy
     cp -p "$SRC"/deploy/monitor-agent.service.example "$DST"/deploy/
-    mkdir -p "$DST"/tests
-    cp -p "$SRC"/tests/*.py "$DST"/tests/
     chmod 755 "$DST"/*.py "$DST"/README.md "$DST"/DOCUMENTATION.md
     echo "[2/5] 已完成覆盖安装到 $DST"
 
@@ -148,14 +145,6 @@ remove_systemd() {
     echo "  [提示] 如需恢复，请再次执行: sudo bash $0 systemd"
 }
 
-run_tests() {
-    if [[ ! -f "$SRC/tests/run_tests.py" ]]; then
-        echo "错误：未找到测试入口 $SRC/tests/run_tests.py（请确认源目录完整）" >&2
-        exit 1
-    fi
-    python3 "$SRC/tests/run_tests.py"
-}
-
 uninstall_all() {
     require_root
     echo "== 完全卸载 =="
@@ -180,15 +169,12 @@ case "$MODE" in
     systemd-remove)
         remove_systemd
         ;;
-    test)
-        run_tests
-        ;;
     uninstall)
         uninstall_all
         ;;
     *)
         echo "未知参数: $MODE" >&2
-        echo "用法: sudo bash $0 [files|systemd|systemd-remove|test|uninstall]" >&2
+        echo "用法: sudo bash $0 [files|systemd|systemd-remove|uninstall]" >&2
         exit 2
         ;;
 esac
