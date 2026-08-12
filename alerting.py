@@ -431,6 +431,10 @@ async def notify_startup_report(snapshot: MetricSnapshot) -> bool:
       下次进程启动会再发一次）。
     """
     value, body = _build_startup_report(snapshot)
+    services = snapshot.services or {}
+    up = [n for n, s in services.items() if s == "UP"]
+    down = [n for n, s in services.items() if s == "DOWN"]
+    skipped = [n for n, s in services.items() if s == "SKIP"]
     alert = {
         "metric": "startup:report",
         "hostname": snapshot.hostname,
