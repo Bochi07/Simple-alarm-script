@@ -114,6 +114,7 @@ monitor-agent/
   事件循环不卡顿；退出时该线程池有界收尾（默认 5 秒上限）；
 - **推送重试**：推送失败按 `2s → 4s → 8s` 指数退避（`PUSH_RETRY_BACKOFF × 2ⁿ`，
   最多 `PUSH_MAX_RETRIES` 次重试），仍失败则本轮放弃、下一轮重新触发；
+  推送整体在独立线程中执行，网络抖动/超时不会阻塞事件循环与其他监控循环；
 - **告警风暴抑制**：同指标同级别（`metric:level`）在冷却窗口内只推一次；
   日志按代码（`log:<code>`）聚合 + 冷却；
 - **恢复通知可靠性**：指标/服务恢复时先生成恢复通知，**推送成功后才把状态落盘为
@@ -131,8 +132,8 @@ monitor-agent/
 
 | 项 | 要求 |
 |---|---|
-| 操作系统 | Linux（优先 systemd 发行版；无 systemd 也可手动启动） |
-| Python | ≥ 3.10（开发/验证环境为 3.12） |
+| 操作系统 | Linux 为主（含 CentOS 7 等旧版 systemd；无 systemd 也可手动启动）；macOS 可运行核心指标监控；Windows 仅指标与文件型日志可用（命令型日志自动跳过） |
+| Python | ≥ 3.8（开发/验证环境为 3.12；类型注解已兼容 3.8+） |
 | Python 依赖 | `psutil`（见 `requirements.txt`） |
 | 网络 | 仅出站 HTTPS，用于推送钉钉 |
 | 权限 | 读日志 / socket 需要 root；普通运行也能监控系统指标 |
@@ -195,10 +196,16 @@ sudo bash install.sh systemd
 该命令在 5.4 基础上额外完成：
 
 1. 安装 `/etc/systemd/system/monitor-agent.service`（模板中 `__MONITOR_DIR__`
-   已替换为实际安装目录）；
+   与 `__PYTHON_BIN__` 已替换为实际安装目录与 `python3` 路径，不依赖
+   `/usr/bin/python3` 固定位置）；
 2. 生成 `/etc/monitor-agent/env` 密钥模板（`root:root 0600`）与
    `/etc/monitor-agent/config.example.json`；
 3. `systemctl daemon-reload && systemctl enable --now monitor-agent`。
+
+旧版 systemd 兼容：CentOS 7 等系统（systemd < 235）不支持
+`RuntimeDirectory/StateDirectory/LogsDirectory` 指令，安装脚本会自动检测
+版本并改用 `deploy/monitor-agent.service.legacy.example` 兼容模板
+（由 `ExecStartPre` 手工创建运行目录），其余加固选项不受影响。
 
 开机自动运行、崩溃自动拉起（`Restart=on-failure`），无需任何终端。
 
@@ -390,7 +397,9 @@ nginx，会判定 SKIP（不误报 DOWN），同时向钉钉发送**一次**汇�
 ```
 
 **命令型**（`command`）：定时执行命令并全文匹配，同轮重复行去重；命令不存在时
-启动检测一次即静默跳过（安装后再启动进程即恢复监控）。
+启动检测一次即静默跳过（安装后再启动进程即恢复监控）。执行 shell 默认自动
+探测 `/bin/bash` → `/bin/sh`（可用 `MONITOR_COMMAND_SHELL` 覆盖）；在
+Windows 等没有 POSIX shell 的环境下，命令型任务自动跳过，文件型日志不受影响。
 
 ```json
 {
@@ -465,6 +474,8 @@ nginx，会判定 SKIP（不误报 DOWN），同时向钉钉发送**一次**汇�
 | `PUSH_TIMEOUT` | 5 | 单次 HTTP 推送超时（秒） |
 | `PUSH_MAX_RETRIES` | 3 | 推送失败后的重试次数（退避序列 `2s→4s→8s`） |
 | `PUSH_RETRY_BACKOFF` | 2.0 | 首次退避基数（秒），第 n 次重试等待 `基数 × 2ⁿ⁻¹` |
+| `MONITOR_COMMAND_SHELL` | 空 | 命令型日志使用的 shell（默认自动探测 `/bin/bash` → `/bin/sh`；Windows 无 POSIX shell 时自动跳过命令型任务） |
+| `LOG_COMMAND_TIMEOUT` | 15 | 命令型日志单次执行超时（秒） |
 | `CPU_PERCENT_WARNING` / `CPU_PERCENT_CRITICAL` | 80 / 95 | CPU 分级阈值覆盖 |
 | `MEMORY_PERCENT_WARNING` / `MEMORY_PERCENT_CRITICAL` | 80 / 92 | 内存分级阈值覆盖 |
 | `DISK_PERCENT_WARNING` / `DISK_PERCENT_CRITICAL` | 80 / 90 | 磁盘分级阈值覆盖 |
@@ -639,8 +650,27 @@ systemd 部署在 `/var/log/monitor-agent/monitor-agent.log`。设置
 
 **Q12：systemd 方式下提示 `/usr/bin/python3` 不存在？**
 
-部分发行版 python3 位于其他路径，将服务单元中 `ExecStart` 改为 `which python3`
-的完整路径后 `systemctl daemon-reload && systemctl restart monitor-agent`。
+新版安装脚本已自动探测 `python3` 路径并写入服务单元，正常不会出现该问题。
+若仍遇到（例如安装后更换了 Python），请手动修改
+`/etc/systemd/system/monitor-agent.service` 中 `ExecStart=` 的 python 路径，
+然后 `systemctl daemon-reload && systemctl restart monitor-agent`；
+重跑 `sudo bash install.sh systemd` 也会自动修正。
+
+**Q13：机器上没有 systemd（旧版 CentOS / Alpine / 容器）怎么办？**
+
+安装脚本会自动检测：无 systemd 时 `install.sh systemd` 会给出明确错误，
+不会留下一个无法启动的服务单元。此时请改用 `sudo bash install.sh files`
+安装程序文件，再手工启动：`python3 /opt/monitor-agent/main.py`（或用
+openrc / sysvinit / supervisor / cron 自启）。CentOS 7 等 systemd < 235
+的机器无需手工处理：脚本会自动改用 legacy 兼容模板。
+
+**Q14：能在 Windows / macOS 上跑吗？**
+
+macOS 可运行完整指标监控与文件型日志（`/proc` 通道自动回退 psutil，
+温度无传感器时自动禁用）；命令型日志在 macOS 使用系统自带 `/bin/bash` 可正常工作。
+Windows 上指标监控与文件型日志可用，命令型日志因缺少 POSIX shell 自动跳过；
+`install.sh systemd` 仅支持 Linux。核心设计目标是各类 Linux 服务器与家用
+Linux/macOS 主机，Windows 建议在 WSL 中运行以获得完整功能。
 
 ---
 

@@ -7,24 +7,20 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-# 安装时由 install.sh 将 __MONITOR_DIR__ 替换为实际安装目录（默认 /opt/monitor-agent）
-# 密钥与按主机配置通过 /etc/monitor-agent/env 注入（install.sh systemd 会自动生成模板）
-# 缺省时忽略该文件，告警仅本地留痕
+# 旧版 systemd（< 235，如 CentOS 7）不支持 RuntimeDirectory/StateDirectory/LogsDirectory，
+# 因此由 ExecStartPre 手工创建运行目录；其余加固选项在 systemd 219+ 均可用。
 EnvironmentFile=-/etc/monitor-agent/env
 Environment=MONITOR_LOG_FILE=/var/log/monitor-agent/monitor-agent.log
 Environment=PID_FILE=/run/monitor-agent/monitor-agent.pid
 Environment=ALERT_HISTORY_FILE=/var/lib/monitor-agent/alerts.jsonl
 Environment=ALERT_STATE_FILE=/var/lib/monitor-agent/alert-state.json
 Environment=SKIP_NOTIFY_FILE=/var/lib/monitor-agent/skip-notified.json
-# 安装时由 install.sh 将 __PYTHON_BIN__ / __MONITOR_DIR__ 替换为实际路径
+ExecStartPre=/bin/mkdir -p /run/monitor-agent /var/lib/monitor-agent /var/log/monitor-agent
 ExecStart=__PYTHON_BIN__ __MONITOR_DIR__/main.py
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=15
-RuntimeDirectory=monitor-agent
-StateDirectory=monitor-agent
-LogsDirectory=monitor-agent
 NoNewPrivileges=true
 ProtectHome=true
 PrivateTmp=true

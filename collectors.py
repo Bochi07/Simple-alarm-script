@@ -38,6 +38,19 @@ THERMAL_ZONE_DIR = Path("/sys/class/thermal")
 EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="monitor-agent")
 
 
+async def await_executor_future(fut):
+    """等待线程池 Future 完成（返回其结果/抛出其异常）。
+
+    不直接 ``await fut``：存在已知竞态——信号（SIGTERM/SIGINT）恰在线程
+    完成前后到达时，线程池 ``call_soon_threadsafe`` 的唤醒回调可能丢失，
+    协程会永久挂起（事件循环空转在 select）。改为定时轮询完成状态：
+    事件循环定时器必然触发，即使唤醒回调丢失也能恢复。
+    """
+    while not fut.done():
+        await asyncio.sleep(0.05)
+    return fut.result()
+
+
 # ================= 指标聚合数据结构 =================
 @dataclass
 class MetricSnapshot:
@@ -93,7 +106,7 @@ def get_cpu_percent_from_proc() -> float:
     global _prev_cpu_times
     try:
         now = _read_cpu_times()
-    except OSError:
+    except (OSError, RuntimeError):
         return get_cpu_percent()
     if _prev_cpu_times is None:
         _prev_cpu_times = now
@@ -326,4 +339,5 @@ def _collect_sync() -> MetricSnapshot:
 async def collect_snapshot() -> MetricSnapshot:
     """异步采集一轮完整指标：阻塞部分在独立线程执行，不阻塞事件循环。"""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(EXECUTOR, _collect_sync)
+    fut = loop.run_in_executor(EXECUTOR, _collect_sync)
+    return await await_executor_future(fut)

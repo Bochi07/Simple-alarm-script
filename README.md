@@ -31,7 +31,9 @@ python3 main.py
 ## 生产部署（systemd 开机自启）
 
 安装脚本源目录自动定位为仓库自身（克隆后直接在仓库里运行即可），
-默认安装到 `/opt/monitor-agent`：
+默认安装到 `/opt/monitor-agent`；脚本会自动探测 `python3` 路径并写入服务单元
+（不再依赖 `/usr/bin/python3` 固定位置），也会检测 systemd 版本——旧版
+systemd（< 235，如 CentOS 7）自动改用兼容模板：
 
 ```bash
 sudo bash install.sh             # 仅安装/升级程序文件
@@ -111,6 +113,8 @@ JSON 数组：`MONITOR_SERVICES` / `MONITOR_LOG_JOBS`。
 | `PUSH_TIMEOUT` | 5 | 单次 HTTP 推送超时（秒） |
 | `PUSH_MAX_RETRIES` | 3 | 推送失败重试次数（指数退避） |
 | `PUSH_RETRY_BACKOFF` | 2.0 | 首次退避基数（秒） |
+| `MONITOR_COMMAND_SHELL` | 空 | 命令型日志使用的 shell（默认自动探测 bash → sh） |
+| `LOG_COMMAND_TIMEOUT` | 15 | 命令型日志单次执行超时（秒） |
 | `CPU_PERCENT_WARNING` / `CPU_PERCENT_CRITICAL` | 80 / 95 | CPU 分级阈值覆盖 |
 | `MEMORY_PERCENT_WARNING` / `MEMORY_PERCENT_CRITICAL` | 80 / 92 | 内存分级阈值覆盖 |
 | `DISK_PERCENT_WARNING` / `DISK_PERCENT_CRITICAL` | 80 / 90 | 磁盘分级阈值覆盖 |
@@ -135,6 +139,7 @@ JSON 数组：`MONITOR_SERVICES` / `MONITOR_LOG_JOBS`。
   与 `logwatch_loop`（日志语义）两个协程；
 - 指标采集的阻塞 IO（1 秒 CPU 采样、socket 探测、子进程命令）全部提交到
   应用自有线程池执行，不阻塞事件循环；
+- 钉钉推送（含退避重试）同样在独立线程中执行，网络抖动不会卡住事件循环；
 - 告警按“指标:级别 / 日志代码”聚合 + 冷却去抖，冷却与状态跨重启持久化；
 - 钉钉推送失败按 `2s → 4s → 8s` 指数退避重试，仍失败则本地留痕、下轮重试；
 - 恢复通知推送成功后才落盘“已恢复”状态，推送失败不丢失。

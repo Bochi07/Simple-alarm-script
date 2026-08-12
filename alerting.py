@@ -13,11 +13,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import logging
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -37,9 +39,13 @@ from config import (
     SKIP_NOTIFY_ONCE,
     THRESHOLDS,
 )
-from collectors import MetricSnapshot
+from collectors import MetricSnapshot, await_executor_future
 
 logger = logging.getLogger("monitor.alert")
+
+# 进程退出信号：push_alert 的退避等待可被立即打断，
+# 避免“收到 SIGTERM 后仍等完所有重试（最多约 30s）”拖慢退出
+PUSH_ABORT = threading.Event()
 
 # 指标名 -> 快照字段名 映射
 _METRIC_FIELD = {
@@ -293,7 +299,7 @@ def _mark_skip_notified(services: list[str]) -> None:
         logger.warning("SKIP 通知标记写入失败（下次启动可能重复通知）: %s", exc)
 
 
-def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str) -> bool:
+async def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str) -> bool:
     """首次启动发现 SKIP（未安装）服务时发送一次汇总通知，返回是否已处理。
 
     - 无 SKIP 或已通知过：返回 False；
@@ -325,16 +331,36 @@ def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str) -> b
         ),
     }
     logger.warning("首次启动发现 SKIP 服务 %s，发送一次性通知", names)
-    pushed = push_alert(alert)
+    pushed = await _push_in_executor(alert)
     if pushed or not DINGTALK_WEBHOOK:
         _mark_skip_notified(names)
         return True
     return False
 
 
+async def _push_in_executor(alert: dict) -> bool:
+    """将阻塞式推送（HTTP + 退避重试）放入线程池，避免阻塞 asyncio 事件循环。"""
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(None, push_alert, alert)
+    return await await_executor_future(fut)
+
+
+async def push_alert_async(alert: dict) -> bool:
+    """异步推送单条告警：等价于 push_alert，但不会阻塞事件循环。"""
+    return await _push_in_executor(alert)
+
+
 def _push_once(url: str, body: bytes) -> bool:
     """单次 HTTP 推送，返回钉钉是否受理成功。"""
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            # 部分企业代理/网关会拦截默认 Python-urllib UA，显式声明来源
+            "User-Agent": "monitor-agent/1.0",
+        },
+    )
     with urllib.request.urlopen(req, timeout=PUSH_TIMEOUT) as resp:
         ret = json.loads(resp.read().decode("utf-8"))
         ok = ret.get("errcode", -1) == 0
@@ -364,7 +390,9 @@ def push_alert(alert: dict) -> bool:
             return False
         backoff = PUSH_RETRY_BACKOFF * (2 ** (attempt - 1))
         logger.info("%.1fs 后重试推送 %s", backoff, alert["metric"])
-        time.sleep(backoff)
+        if PUSH_ABORT.wait(timeout=backoff):
+            logger.warning("进程正在退出，放弃剩余重试: %s", alert["metric"])
+            return False
 
 
 # ================= 阈值判定引擎 =================

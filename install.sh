@@ -15,6 +15,10 @@
 #   4. 刷新 <目标目录>.zip 归档（若本机有 zip 命令，旧包同样留备份）；
 #   5. systemd 模式：注册 monitor-agent.service 开机自启并立即启动，
 #      同时生成 /etc/monitor-agent/env 密钥模板（root:root 0600）。
+#   6. 自动探测 python3 路径并写入服务单元；自动检测 systemd 版本，
+#      <235（如 CentOS 7）改用兼容模板（legacy）；
+#   7. 安全护栏：拒绝把安装目录设为主目录、根目录或源码仓库自身，
+#      防止卸载时误删重要数据。
 #
 # 安装位置默认 /opt/monitor-agent，可用环境变量覆盖：
 #   sudo MONITOR_AGENT_DIR=/usr/local/monitor-agent bash install.sh systemd
@@ -29,7 +33,8 @@ UNIT_PATH=/etc/systemd/system/${SERVICE_NAME}
 ETC_DIR=/etc/monitor-agent
 ENV_FILE=${ETC_DIR}/env
 CONFIG_EXAMPLE=${ETC_DIR}/config.example.json
-TS=$(date +%Y%m%d-%H%M%S)
+PYTHON_BIN=${MONITOR_AGENT_PYTHON:-$(command -v python3 || true)}
+TS=$(date +%Y%m%d-%H%M%S)-$$
 BAK=${DST}.bak-${TS}
 
 MODE="${1:-files}"
@@ -41,7 +46,53 @@ require_root() {
     fi
 }
 
+guard_target() {
+    # 防止 MONITOR_AGENT_DIR 指向危险路径导致 uninstall 误删重要目录
+    local canonical home_canon src_canon
+    canonical=$(realpath -m -- "$DST" 2>/dev/null || printf '%s' "$DST")
+    if [[ -z "$canonical" || "$canonical" == "/" ]]; then
+        echo "错误：MONITOR_AGENT_DIR 无效（不能为空或根目录）: $DST" >&2
+        exit 1
+    fi
+    home_canon=$(realpath -m -- "$HOME" 2>/dev/null || printf '%s' "$HOME")
+    if [[ "$canonical" == "$home_canon" || "$canonical" == "$home_canon"/* ]]; then
+        echo "错误：不允许把 MONITOR_AGENT_DIR 设为主目录或其子目录: $canonical" >&2
+        exit 1
+    fi
+    src_canon=$(realpath -m -- "$SRC" 2>/dev/null || printf '%s' "$SRC")
+    if [[ "$canonical" == "$src_canon" ]]; then
+        echo "错误：MONITOR_AGENT_DIR 不能是源码仓库自身: $canonical" >&2
+        echo "       （卸载时会删除该目录，请换一个安装位置，如 /opt/monitor-agent）" >&2
+        exit 1
+    fi
+}
+
+check_python() {
+    # 返回 0 表示可用；缺失或版本过低时输出错误并返回 1
+    if [[ -z "$PYTHON_BIN" ]]; then
+        echo "错误：未找到 python3，请先安装 Python >= 3.8（或设置 MONITOR_AGENT_PYTHON）" >&2
+        return 1
+    fi
+    if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
+        echo "错误：需要 Python >= 3.8，当前 $PYTHON_BIN 版本过低" >&2
+        return 1
+    fi
+    local ver
+    ver=$("$PYTHON_BIN" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')
+    echo "  [OK] Python: $PYTHON_BIN ($ver)"
+    return 0
+}
+
+systemd_available() {
+    [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
+}
+
+systemd_version() {
+    systemctl --version 2>/dev/null | sed -n '1s/.* \([0-9][0-9]*\).*/\1/p'
+}
+
 install_files() {
+    guard_target
     if [[ ! -d "$SRC" ]]; then
         echo "错误：未找到源目录 $SRC" >&2
         exit 1
@@ -59,14 +110,17 @@ install_files() {
     sed "s|__MONITOR_DIR__|${DST//&/\\&}|g" \
         "$SRC"/deploy/monitor-agent.service.example \
         > "$DST"/deploy/monitor-agent.service.example
+    sed "s|__MONITOR_DIR__|${DST//&/\\&}|g" \
+        "$SRC"/deploy/monitor-agent.service.legacy.example \
+        > "$DST"/deploy/monitor-agent.service.legacy.example
     chmod 755 "$DST"/*.py
     echo "[2/5] 已完成覆盖安装到 $DST"
 
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -m py_compile "$DST"/*.py
+    if check_python; then
+        "$PYTHON_BIN" -m py_compile "$DST"/*.py
         echo "[3/5] 语法检查通过"
     else
-        echo "[3/5] 跳过语法检查（未找到 python3）"
+        echo "[3/5] 警告：跳过语法检查（未找到可用的 python3）"
     fi
 
     if command -v zip >/dev/null 2>&1; then
@@ -130,13 +184,31 @@ EOF
 
 install_systemd() {
     require_root
+    if ! systemd_available; then
+        echo "错误：未检测到 systemd（PID 1 不是 systemd 或缺少 systemctl）" >&2
+        echo "       本机请改用: sudo bash $0 files 后手动启动，或改用 openrc/sysvinit 方案" >&2
+        exit 1
+    fi
+    if ! check_python; then
+        exit 1
+    fi
     install_files
     echo
     echo "== 注册 systemd 开机自启 =="
-    sed "s|__MONITOR_DIR__|${DST//&/\\&}|g" \
-        "$SRC"/deploy/monitor-agent.service.example > "$UNIT_PATH"
+    local sv template
+    sv=$(systemd_version)
+    if [[ -n "$sv" && "$sv" -lt 235 ]]; then
+        template="$SRC/deploy/monitor-agent.service.legacy.example"
+        echo "  [OK] 检测到旧版 systemd ($sv)，使用兼容模板（手工创建运行目录）"
+    else
+        template="$SRC/deploy/monitor-agent.service.example"
+        echo "  [OK] 使用标准模板（systemd ${sv:-未知版本}）"
+    fi
+    sed -e "s|__MONITOR_DIR__|${DST//&/\\&}|g" \
+        -e "s|__PYTHON_BIN__|${PYTHON_BIN//&/\\&}|g" \
+        "$template" > "$UNIT_PATH"
     chmod 644 "$UNIT_PATH"
-    echo "  [OK] 已安装服务单元: $UNIT_PATH"
+    echo "  [OK] 已安装服务单元: $UNIT_PATH（ExecStart: $PYTHON_BIN）"
     write_env_template
     systemctl daemon-reload
     systemctl enable --now "$SERVICE_NAME"
@@ -160,6 +232,7 @@ remove_systemd() {
 
 uninstall_all() {
     require_root
+    guard_target
     echo "== 完全卸载 =="
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
     rm -f "$UNIT_PATH"

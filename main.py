@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
 监控告警中间件主入口（单进程常驻，asyncio 异步调度）。
 
@@ -32,13 +34,16 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import psutil
+
 from alerting import (
     AlertEngine,
     Cooldown,
     LogRecoveryTracker,
+    PUSH_ABORT,
     StateStore,
     notify_skipped_once,
-    push_alert,
+    push_alert_async,
 )
 from collectors import EXECUTOR as COLLECT_EXECUTOR
 from collectors import collect_snapshot, prime_cpu_baseline
@@ -55,6 +60,7 @@ from config import (
     LOG_MAX_BYTES,
     LOG_SCAN_INTERVAL,
     PID_FILE,
+    SHUTDOWN_TIMEOUT,
     validate,
 )
 from log_monitor import LogSemanticEngine
@@ -65,7 +71,10 @@ logger = logging.getLogger("monitor")
 latest_snapshot = None
 _shutdown = asyncio.Event()
 _pid_fd = None
-EXECUTOR_SHUTDOWN_TIMEOUT = float(os.getenv("MONITOR_SHUTDOWN_TIMEOUT", "5"))  # 线程池收尾上限（秒）
+_watchdog_forced = False
+
+# 看门狗宽限：收到关闭信号后，等待主循环自然退出的秒数；超时则强制取消并停循环
+WATCHDOG_GRACE_SECONDS = 3.0
 
 
 # ================= 日志 =================
@@ -94,13 +103,8 @@ def _read_stale_pid() -> int | None:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+    # psutil.pid_exists 跨平台（Windows/macOS/Linux），且不依赖信号权限。
+    return psutil.pid_exists(pid)
 
 
 def _acquire_pid_lock() -> None:
@@ -166,14 +170,14 @@ async def metrics_loop(state_store: StateStore) -> None:
                     for name, status in s.services.items()
                     if status == "SKIP"
                 ]
-                notify_skipped_once(s.hostname, skipped, s.timestamp)
+                await notify_skipped_once(s.hostname, skipped, s.timestamp)
             for alert in engine.evaluate(latest_snapshot):
                 logger.warning(
                     "%s: %s -> %s",
                     "恢复通知" if alert["level"] == "Recovery" else "触发告警",
                     alert["metric"], alert["level"],
                 )
-                pushed = push_alert(alert)
+                pushed = await push_alert_async(alert)
                 if pushed or not DINGTALK_WEBHOOK:
                     # 推送成功（或未配置 Webhook 已留痕）后确认状态迁移；
                     # 未配置 Webhook 时无需每轮重复写留痕。
@@ -184,8 +188,10 @@ async def metrics_loop(state_store: StateStore) -> None:
         except Exception as exc:
             logger.exception("指标采集循环异常: %s", exc)
         if _shutdown.is_set():
+            logger.info("指标循环退出（收到关闭信号）")
             break
         if await _sleep_or_shutdown(COLLECT_INTERVAL):
+            logger.info("指标循环退出（睡眠被信号打断）")
             break
 
 
@@ -230,7 +236,7 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 }
                 logger.error("命中关键日志 %s（%d 条），已聚合推送", code, len(group))
                 tracker.persist_seen(code, now)
-                if not push_alert(alert):
+                if not await push_alert_async(alert):
                     if DINGTALK_WEBHOOK:
                         cooldown.clear(f"log:{code}")
 
@@ -254,7 +260,7 @@ async def logwatch_loop(state_store: StateStore) -> None:
                     "diagnosis": "日志命中后，冷却窗口内未再出现新的匹配事件。",
                 }
                 logger.info("日志事件 %s 已恢复（%ss 内无新命中）", code, ALERT_COOLDOWN)
-                pushed = push_alert(alert)
+                pushed = await push_alert_async(alert)
                 if pushed or not DINGTALK_WEBHOOK:
                     tracker.mark_recovered(code)
                 elif DINGTALK_WEBHOOK:
@@ -262,8 +268,10 @@ async def logwatch_loop(state_store: StateStore) -> None:
         except Exception as exc:
             logger.exception("日志监控循环异常: %s", exc)
         if _shutdown.is_set():
+            logger.info("日志循环退出（收到关闭信号）")
             break
         if await _sleep_or_shutdown(LOG_SCAN_INTERVAL):
+            logger.info("日志循环退出（睡眠被信号打断）")
             break
 
 
@@ -279,6 +287,7 @@ async def _sleep_or_shutdown(seconds: float) -> bool:
 
 def _request_shutdown(sig) -> None:
     logger.info("收到信号 %s，正在优雅退出…", sig)
+    PUSH_ABORT.set()  # 打断推送线程的退避等待，加快退出
     _shutdown.set()
 
 
@@ -287,9 +296,42 @@ def _handle_signal(sig, _frame) -> None:
     _request_shutdown(sig)
 
 
+async def shutdown_watchdog() -> None:
+    """兜底退出看门狗：保证进程收到关闭信号后必定能在有限时间内退出。
+
+    正常情况下主循环会在宽限期内自然退出（看门狗随后被取消）；
+    若个别 Future 唤醒回调在信号竞态下丢失导致主循环挂起，宽限超时后
+    强制取消所有任务并停止事件循环，进程仍走完整的收尾流程。
+    """
+    global _watchdog_forced
+    try:
+        while not _shutdown.is_set():
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(WATCHDOG_GRACE_SECONDS)
+        logger.warning(
+            "收到关闭信号后 %.1fs 内主循环未自然退出，看门狗强制收尾",
+            WATCHDOG_GRACE_SECONDS,
+        )
+        current = asyncio.current_task()
+        for task in asyncio.all_tasks():
+            if task is not current and not task.done():
+                task.cancel()
+        _watchdog_forced = True
+        # 取消可能因唤醒丢失而无法投递，最后手段：强制停止事件循环
+        asyncio.get_running_loop().call_soon(asyncio.get_running_loop().stop)
+    except asyncio.CancelledError:
+        pass
+
+
 async def run() -> None:
     state_store = StateStore(ALERT_STATE_FILE)
-    await asyncio.gather(metrics_loop(state_store), logwatch_loop(state_store))
+    watchdog = asyncio.create_task(shutdown_watchdog())
+    try:
+        await asyncio.gather(metrics_loop(state_store), logwatch_loop(state_store))
+    except asyncio.CancelledError:
+        logger.warning("主循环被看门狗取消，按退出流程收尾")
+    finally:
+        watchdog.cancel()
 
 
 def _run_main_loop() -> None:
@@ -306,15 +348,23 @@ def _run_main_loop() -> None:
                 loop.add_signal_handler(sig, _request_shutdown, sig)
             except (NotImplementedError, RuntimeError):
                 signal.signal(sig, _handle_signal)
-        loop.run_until_complete(run())
+        try:
+            loop.run_until_complete(run())
+        except RuntimeError as exc:
+            if not _watchdog_forced:
+                raise
+            logger.warning("事件循环被看门狗强制停止（兜底路径）: %s", exc)
     finally:
+        logger.info("退出流程开始：取消未完成任务…")
         pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
         for task in pending:
             task.cancel()
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        logger.info("退出流程：关闭异步生成器…")
         loop.run_until_complete(loop.shutdown_asyncgens())
         try:
+            logger.info("退出流程：有界收尾采集线程池（上限 %ss）…", SHUTDOWN_TIMEOUT)
             # 主动有界收尾采集线程池：给一个短时限，超时则放弃等待，保证 SIGTERM 秒级退出
             shutdown_thread = threading.Thread(
                 target=COLLECT_EXECUTOR.shutdown,
@@ -322,15 +372,16 @@ def _run_main_loop() -> None:
                 name="monitor-executor-shutdown",
             )
             shutdown_thread.start()
-            shutdown_thread.join(timeout=EXECUTOR_SHUTDOWN_TIMEOUT)
+            shutdown_thread.join(timeout=SHUTDOWN_TIMEOUT)
             if shutdown_thread.is_alive():
                 logger.warning(
                     "采集线程池收尾超时（%ss），放弃等待，进程立即退出",
-                    EXECUTOR_SHUTDOWN_TIMEOUT,
+                    SHUTDOWN_TIMEOUT,
                 )
         except Exception as exc:
             logger.warning("采集线程池收尾异常（放弃等待，进程立即退出）: %s", exc)
         finally:
+            logger.info("退出流程：关闭事件循环…")
             loop.close()
             asyncio.set_event_loop(None)
 

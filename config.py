@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
 全局配置：阈值规则、钉钉 Webhook、服务清单与日志监控参数。
 
@@ -13,25 +15,53 @@ import json
 import os
 from pathlib import Path
 
+# ============ 环境变量安全解析 ============
+# 任何非法数值统一记录到 _CONFIG_LOAD_ERRORS，由 validate() 汇总为 fatal，
+# 避免 import 阶段直接抛 ValueError 崩溃（坏配置应报友好错误而不是裸 traceback）。
+_CONFIG_LOAD_ERRORS: list[str] = []
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        _CONFIG_LOAD_ERRORS.append(f"{name} 不是合法整数: {raw!r}（已回退默认值 {default}）")
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _CONFIG_LOAD_ERRORS.append(f"{name} 不是合法数字: {raw!r}（已回退默认值 {default}）")
+        return default
+
+
 # ============ 采集与调度 ============
-COLLECT_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))       # 指标采集周期（秒）
-LOG_SCAN_INTERVAL = int(os.getenv("LOG_SCAN_INTERVAL", "10"))     # 日志轮询周期（秒）
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "300"))          # 同类型告警冷却（秒）
+COLLECT_INTERVAL = _env_int("MONITOR_INTERVAL", 60)               # 指标采集周期（秒）
+LOG_SCAN_INTERVAL = _env_int("LOG_SCAN_INTERVAL", 10)             # 日志轮询周期（秒）
+ALERT_COOLDOWN = _env_int("ALERT_COOLDOWN", 300)                  # 同类型告警冷却（秒）
 
 # ============ 钉钉机器人（必须通过环境变量注入） ============
 DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK", "").strip()
 DINGTALK_SECRET = os.getenv("DINGTALK_SECRET", "").strip()        # 加签密钥（可选）
 
 # 推送可靠性：指数退避重试
-PUSH_TIMEOUT = float(os.getenv("PUSH_TIMEOUT", "5"))              # 单次 HTTP 超时（秒）
-PUSH_MAX_RETRIES = int(os.getenv("PUSH_MAX_RETRIES", "3"))        # 失败后的重试次数
-PUSH_RETRY_BACKOFF = float(os.getenv("PUSH_RETRY_BACKOFF", "2.0"))  # 首次退避基数（秒）
+PUSH_TIMEOUT = _env_float("PUSH_TIMEOUT", 5.0)                    # 单次 HTTP 超时（秒）
+PUSH_MAX_RETRIES = _env_int("PUSH_MAX_RETRIES", 3)                # 失败后的重试次数
+PUSH_RETRY_BACKOFF = _env_float("PUSH_RETRY_BACKOFF", 2.0)        # 首次退避基数（秒）
 
 # ============ 告警留痕（jsonl，按大小轮转） ============
 _STATE_DIR = Path(os.getenv("MONITOR_STATE_DIR", "~/.local/state/monitor-agent")).expanduser()
 ALERT_HISTORY_FILE = Path(os.getenv("ALERT_HISTORY_FILE", str(_STATE_DIR / "alerts.jsonl")))
-ALERT_HISTORY_MAX_BYTES = int(os.getenv("ALERT_HISTORY_MAX_BYTES", str(10 * 1024 * 1024)))
-ALERT_HISTORY_BACKUPS = int(os.getenv("ALERT_HISTORY_BACKUPS", "2"))
+ALERT_HISTORY_MAX_BYTES = _env_int("ALERT_HISTORY_MAX_BYTES", 10 * 1024 * 1024)
+ALERT_HISTORY_BACKUPS = _env_int("ALERT_HISTORY_BACKUPS", 2)
 
 # ============ 单实例 PID 锁 ============
 PID_FILE = Path(os.getenv("PID_FILE", str(_STATE_DIR / "monitor-agent.pid")))
@@ -44,14 +74,20 @@ SKIP_NOTIFY_ONCE = os.getenv("SKIP_NOTIFY_ONCE", "1").strip() not in ("0", "fals
 
 # ============ 运行日志（默认落盘状态目录并轮转；设空串则仅 stdout，供 journald） ============
 LOG_FILE = os.getenv("MONITOR_LOG_FILE", str(_STATE_DIR / "monitor-agent.log"))
-LOG_MAX_BYTES = int(os.getenv("MONITOR_LOG_MAX_BYTES", str(5 * 1024 * 1024)))
-LOG_BACKUPS = int(os.getenv("MONITOR_LOG_BACKUPS", "2"))
+LOG_MAX_BYTES = _env_int("MONITOR_LOG_MAX_BYTES", 5 * 1024 * 1024)
+LOG_BACKUPS = _env_int("MONITOR_LOG_BACKUPS", 2)
 
 # ============ 告警/恢复状态持久化（跨重启续用冷却与恢复判定） ============
 ALERT_STATE_FILE = Path(os.getenv("ALERT_STATE_FILE", str(_STATE_DIR / "alert-state.json")))
 
-# 配置加载过程中的错误收集（供 validate() 汇总，启动时以 fatal 中止）
-_CONFIG_LOAD_ERRORS: list[str] = []
+# ============ 命令型日志监控 ============
+# 执行日志采集命令使用的 shell；留空时自动探测 /bin/bash -> /bin/sh。
+# Windows 等无 POSIX shell 的环境会跳过命令型日志任务（文件型不受影响）。
+COMMAND_SHELL = os.getenv("MONITOR_COMMAND_SHELL", "").strip()
+LOG_COMMAND_TIMEOUT = _env_float("LOG_COMMAND_TIMEOUT", 15.0)     # 单次日志命令超时（秒）
+
+# ============ 退出收尾 ============
+SHUTDOWN_TIMEOUT = _env_float("MONITOR_SHUTDOWN_TIMEOUT", 5.0)    # 线程池收尾上限（秒）
 
 # ============ 分级阈值（Warning / Critical，可环境变量覆盖） ============
 # 覆盖方式：<指标名大写>_WARNING / <指标名大写>_CRITICAL，例如：
@@ -144,7 +180,7 @@ _env_log_jobs = _load_json_env("MONITOR_LOG_JOBS")
 LOG_JOBS = _file_cfg.get("log_jobs", _env_log_jobs if _env_log_jobs is not None else DEFAULT_LOG_JOBS)
 
 # 日志告警单次聚合时最多附带的事件样本行数（防消息超长）
-LOG_ALERT_MAX_SAMPLES = int(os.getenv("LOG_ALERT_MAX_SAMPLES", "5"))
+LOG_ALERT_MAX_SAMPLES = _env_int("LOG_ALERT_MAX_SAMPLES", 5)
 
 
 def validate() -> list[tuple[str, str]]:

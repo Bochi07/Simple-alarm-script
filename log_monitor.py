@@ -14,13 +14,15 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
 import socket
 import subprocess
 import time
 from pathlib import Path
 
-from config import LOG_JOBS, THRESHOLDS
+from config import COMMAND_SHELL, LOG_COMMAND_TIMEOUT, LOG_JOBS, THRESHOLDS
 from collectors import MetricSnapshot, _find_binary
 
 logger = logging.getLogger("monitor.logwatch")
@@ -85,7 +87,16 @@ class CommandLogWatcher:
         self.command = command
         self.patterns = [(re.compile(p), code, desc) for p, code, desc in patterns]
         first = command.split()[0] if command.split() else ""
-        self._missing = bool(first) and _find_binary(first) is None
+        self._shell = _resolve_shell()
+        self._missing = False
+        if not self._shell:
+            logger.warning(
+                "未找到可用 POSIX shell（%s），命令型日志任务将跳过；"
+                "可用 MONITOR_COMMAND_SHELL 指定", command,
+            )
+            self._missing = True
+        elif not first or _find_binary(first) is None:
+            self._missing = True
         if self._missing:
             logger.info("日志命令不存在，跳过该任务（%s 未安装）: %s", first, command)
 
@@ -94,8 +105,8 @@ class CommandLogWatcher:
             return []
         try:
             out = subprocess.run(
-                ["/bin/bash", "-c", self.command],
-                capture_output=True, text=True, timeout=15,
+                [self._shell, "-c", self.command],
+                capture_output=True, text=True, timeout=LOG_COMMAND_TIMEOUT,
             ).stdout
         except Exception as exc:
             logger.warning("日志命令执行失败 %s: %s", self.command, exc)
@@ -112,6 +123,24 @@ class CommandLogWatcher:
                     events.append(LogEvent(code, desc, self.command, line, hostname))
                     break
         return events
+
+
+def _resolve_shell() -> str | None:
+    """确定命令型日志使用的 shell：MONITOR_COMMAND_SHELL > /bin/bash > /bin/sh。
+
+    返回绝对路径；找不到任何可用 shell 时返回 None（调用方跳过命令型任务）。
+    """
+    candidates: list[str] = []
+    if COMMAND_SHELL:
+        candidates.append(COMMAND_SHELL)
+    candidates += ["/bin/bash", "/bin/sh"]
+    for cand in candidates:
+        if not cand:
+            continue
+        path = cand if cand.startswith("/") else shutil.which(cand)
+        if path and Path(path).is_file() and os.access(path, os.X_OK):
+            return path
+    return None
 
 
 class LogSemanticEngine:
