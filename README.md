@@ -40,6 +40,7 @@
 - **日志语义监控**：文件型（offset 增量）与命令型（定时执行）两类日志源；
 - **聚合与冷却**：同代码日志聚合为一条告警 + 冷却去抖，杜绝 502 / OOMKilled 刷屏；
 - **可靠推送**：钉钉推送失败指数退避重试（2s → 4s → 8s），仍失败则本地留痕、下轮补发；
+- **多通知渠道**：钉钉（加签）/ 企业微信 / 飞书 / stdout，按环境变量自动路由，无需改代码；
 - **状态持久化**：冷却、告警级别、服务状态落盘，进程重启不重复告警；
 - **全量留痕**：所有告警写入 `alerts.jsonl`，按大小自动轮转；
 - **单实例锁**：PID 文件 + 存活检测，防止重复启动双份告警；
@@ -217,6 +218,9 @@ sudo nano /etc/monitor-agent/env
 sudo systemctl restart monitor-agent
 ```
 
+不用钉钉的话，直接配置 `WECOM_WEBHOOK`（企业微信）或 `FEISHU_WEBHOOK`（飞书）即可，
+调试期也可用 `MONITOR_NOTIFY_STDOUT=1` 把告警打印到 stdout（见 3.9 环境变量表）。
+
 ### 3.7 启用业务监控（服务 / 日志）
 
 默认只监控系统指标，不会误报。要监控 nginx、docker 等业务，任选一种方式注入清单：
@@ -326,6 +330,22 @@ tail -f ~/.local/state/monitor-agent/alerts.jsonl   # 看留痕（systemd 下在
 | `MONITOR_SHUTDOWN_TIMEOUT` | 5 | 退出时线程池收尾上限（秒） |
 | `ALERT_STATE_FILE` | 状态目录/`alert-state.json` | 冷却 / 级别 / 服务状态持久化文件 |
 
+### 3.10 配置热重载（SIGHUP）
+
+阈值、服务/日志清单、磁盘挂载点、通知渠道、静默窗口等改动，无需重启即可生效：
+
+```bash
+sudo kill -HUP "$(cat /run/monitor-agent/monitor-agent.pid)"
+```
+
+收到 SIGHUP 后，进程会重新读取 `MONITOR_CONFIG_FILE` 指向的 JSON 配置与进程内环境变量，
+并重建指标/日志引擎——采集周期、冷却窗口、日志样本数等调度参数也会一并生效。
+重载校验失败（如非法阈值）会打印错误并保留原配置继续运行。
+
+注意：systemd 部署下，修改 `/etc/monitor-agent/env` 里的环境变量**不能**靠 SIGHUP 生效——
+systemd 只在服务启动/重启时重新读取 EnvironmentFile，因此环境变量改动仍需
+`sudo systemctl restart monitor-agent`。
+
 ---
 
 ## 4. 后续更新
@@ -340,6 +360,8 @@ sudo bash install.sh systemd    # 覆盖安装 + 重建服务单元并重启
 
 旧代码会自动备份到 `/opt/monitor-agent.bak-<时间戳>`，`/etc/monitor-agent/env`
 不会被动过；如需回滚，把备份目录换回原位置并重启服务即可。
+
+只改了阈值/清单等配置时，可用 SIGHUP 热重载免重启（见 3.10）；拉取到新代码仍按上面三步更新。
 
 ---
 
@@ -432,6 +454,13 @@ cron 自启。CentOS 7 等 systemd < 235 的机器无需手工处理，脚本自
 macOS 可运行完整指标监控与文件型日志；Windows 上指标与文件型日志可用，
 命令型日志因缺少 POSIX shell 自动跳过；`install.sh systemd` 仅支持 Linux，
 Windows 建议在 WSL 中运行以获得完整功能。
+
+**Q15：修改配置后必须重启吗？**
+
+`MONITOR_CONFIG_FILE` 指向的 JSON 配置（阈值/服务/日志清单/磁盘/渠道/静默窗口）改完发
+SIGHUP 即可热重载，调度参数（周期/冷却/样本数）也会一并生效（见 3.10）。systemd 下修改
+`/etc/monitor-agent/env` 的环境变量则必须 `sudo systemctl restart monitor-agent`，
+因为 systemd 只在启动/重启时重新读取 EnvironmentFile。
 
 ---
 

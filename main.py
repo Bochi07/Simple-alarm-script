@@ -50,16 +50,12 @@ from alerting import (
 from collectors import EXECUTOR as COLLECT_EXECUTOR
 from collectors import collect_snapshot, prime_cpu_baseline, utc_now_iso
 from config import (
-    ALERT_COOLDOWN,
     ALERT_HISTORY_FILE,
     ALERT_STATE_FILE,
-    COLLECT_INTERVAL,
-    LOG_ALERT_MAX_SAMPLES,
     LOG_BACKUPS,
     LOG_FILE,
     LOG_JOBS,
     LOG_MAX_BYTES,
-    LOG_SCAN_INTERVAL,
     PID_FILE,
     SHUTDOWN_TIMEOUT,
     STARTUP_NOTIFY,
@@ -75,6 +71,7 @@ _shutdown = asyncio.Event()
 _pid_fd = None
 _watchdog_forced = False
 _reload_requested = False
+_reload_gen = 0
 
 # 看门狗宽限：收到关闭信号后，等待主循环自然退出的秒数；超时则强制取消并停循环
 WATCHDOG_GRACE_SECONDS = 3.0
@@ -149,8 +146,14 @@ async def metrics_loop(state_store: StateStore) -> None:
     """指标采集 + 阈值告警循环。"""
     global latest_snapshot
     engine = AlertEngine(store=state_store)
+    engine_gen = 0
     startup_notice_attempted = False
     while not _shutdown.is_set():
+        gen = _apply_reload()
+        if gen != engine_gen:
+            engine_gen = gen
+            engine = AlertEngine(store=state_store)
+            logger.info("指标告警引擎已按新配置重建")
         try:
             latest_snapshot = await collect_snapshot()
             s = latest_snapshot
@@ -195,7 +198,7 @@ async def metrics_loop(state_store: StateStore) -> None:
         if _shutdown.is_set():
             logger.info("指标循环退出（收到关闭信号）")
             break
-        if await _sleep_or_shutdown(COLLECT_INTERVAL):
+        if await _sleep_or_shutdown(config.COLLECT_INTERVAL):
             logger.info("指标循环退出（睡眠被信号打断）")
             break
 
@@ -203,23 +206,18 @@ async def metrics_loop(state_store: StateStore) -> None:
 # ================= 日志监控循环 =================
 async def logwatch_loop(state_store: StateStore) -> None:
     """关键错误日志语义监控循环：同代码事件聚合 + 冷却去抖，避免告警风暴。"""
-    global _reload_requested
     engine = LogSemanticEngine(socket.gethostname())
-    cooldown = Cooldown(ALERT_COOLDOWN, store=state_store, prefix="logcooldown")
+    cooldown = Cooldown(config.ALERT_COOLDOWN, store=state_store, prefix="logcooldown")
     tracker = LogRecoveryTracker(store=state_store)
+    engine_gen = 0
     while not _shutdown.is_set():
-        if _reload_requested:
-            _reload_requested = False
-            import config as cfg
-            problems = cfg.reload_config()
-            for level, msg in problems:
-                if level == "fatal":
-                    logger.error("配置重载失败: [%s] %s", level, msg)
-                else:
-                    logger.warning("配置重载: [%s] %s", level, msg)
-            # 服务/日志清单可能变化：重建 watcher（阈值由 alerting 动态读取）
+        gen = _apply_reload()
+        if gen != engine_gen:
+            engine_gen = gen
             engine = LogSemanticEngine(socket.gethostname())
-            logger.info("配置重载完成，日志监控引擎已重建")
+            cooldown = Cooldown(config.ALERT_COOLDOWN, store=state_store, prefix="logcooldown")
+            tracker = LogRecoveryTracker(store=state_store)
+            logger.info("日志监控引擎已按新配置重建（watcher/冷却/恢复跟踪）")
         if latest_snapshot is None:
             # 等待首个指标快照，保证日志联动诊断有数据可用
             if await _sleep_or_shutdown(1):
@@ -241,7 +239,7 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 tracker.mark_seen(code, now)
                 if not cooldown.allowed(f"log:{code}"):
                     continue
-                samples = group[:LOG_ALERT_MAX_SAMPLES]
+                samples = group[:config.LOG_ALERT_MAX_SAMPLES]
                 body = f"命中 {len(group)} 条"
                 if samples:
                     body += "\n\n" + "\n".join(
@@ -298,14 +296,14 @@ async def logwatch_loop(state_store: StateStore) -> None:
                     "metric": f"log:{code}",
                     "hostname": socket.gethostname(),
                     "timestamp": utc_now_iso(),
-                    "value": f"冷却窗口 {ALERT_COOLDOWN}s 内无新命中",
+                    "value": f"冷却窗口 {config.ALERT_COOLDOWN}s 内无新命中",
                     "threshold": "-",
                     "level": "Recovery",
                     "unit": "-",
                     "advice": "关键日志模式已停止出现，判定恢复正常。请确认对应服务/容器状态。",
                     "diagnosis": "日志命中后，冷却窗口内未再出现新的匹配事件。",
                 }
-                logger.info("日志事件 %s 已恢复（%ss 内无新命中）", code, ALERT_COOLDOWN)
+                logger.info("日志事件 %s 已恢复（%ss 内无新命中）", code, config.ALERT_COOLDOWN)
                 pushed = await push_alert_async(alert)
                 if pushed or not config.notify_configured():
                     tracker.mark_recovered(code)
@@ -316,7 +314,7 @@ async def logwatch_loop(state_store: StateStore) -> None:
         if _shutdown.is_set():
             logger.info("日志循环退出（收到关闭信号）")
             break
-        if await _sleep_or_shutdown(LOG_SCAN_INTERVAL):
+        if await _sleep_or_shutdown(config.LOG_SCAN_INTERVAL):
             logger.info("日志循环退出（睡眠被信号打断）")
             break
 
@@ -342,6 +340,27 @@ def _handle_reload(_sig, _frame) -> None:
     global _reload_requested
     _reload_requested = True
     logger.info("收到 SIGHUP，标记配置重载（下一轮生效）")
+
+
+def _apply_reload() -> int:
+    """执行一次配置重载（幂等），返回当前重载代数，供各循环判断是否重建引擎。
+
+    SIGHUP 后由 metrics/logwatch 两个循环分别检查：先到者执行 reload_config()
+    并递增代数；两个循环各自发现代数变化后重建自己的引擎/冷却/跟踪器，
+    保证周期、冷却、样本数等调度参数与阈值/清单一起真正生效。
+    """
+    global _reload_requested, _reload_gen
+    if _reload_requested:
+        _reload_requested = False
+        import config as cfg
+        problems = cfg.reload_config()
+        for level, msg in problems:
+            if level == "fatal":
+                logger.error("配置重载失败: [%s] %s", level, msg)
+            else:
+                logger.warning("配置重载: [%s] %s", level, msg)
+        _reload_gen += 1
+    return _reload_gen
 
 
 def _handle_signal(sig, _frame) -> None:
@@ -501,7 +520,7 @@ def main() -> None:
         prime_cpu_baseline()
         logger.info(
             "监控告警中间件启动：指标周期 %ss，日志轮询周期 %ss，Webhook=%s",
-            COLLECT_INTERVAL, LOG_SCAN_INTERVAL,
+            config.COLLECT_INTERVAL, config.LOG_SCAN_INTERVAL,
             "已配置" if config.notify_configured() else "未配置(仅留痕)",
         )
         _run_main_loop()

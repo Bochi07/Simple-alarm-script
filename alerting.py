@@ -545,6 +545,9 @@ def _push_once(url: str, body: bytes) -> bool:
         if isinstance(ret, dict):
             if "errcode" in ret:
                 ok = ret.get("errcode") == 0
+            elif "StatusCode" in ret:
+                # 飞书老版本返回 {"StatusCode": ...}（大写 S）
+                ok = ret.get("StatusCode") in (0, "0")
             elif "code" in ret:
                 ok = ret.get("code") in (0, "0")
             else:
