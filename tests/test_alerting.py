@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from unittest import mock
 
-from alerting import AlertEngine, Cooldown, StateStore, _compute_sign, _sign
+from alerting import AlertEngine, Cooldown, StateStore, _compute_sign, _silence_active, _sign
 from collectors import MetricSnapshot
 
 
@@ -159,7 +159,9 @@ class TestAlertEngine:
             alerts = engine.evaluate(make_snapshot(load1=9.0))
         load = [a for a in alerts if a["metric"] == "load1"]
         assert load and load[0]["level"] == "Warning"
-        assert "x核" in load[0]["threshold"]
+        # value 与 threshold 尺度一致：value 标注归一化值 + 原始值，threshold 为每核阈值
+        assert load[0]["value"] == "1.12x核（原始负载 9.00）"
+        assert load[0]["threshold"] == "Warning:1.0x核 / Critical:2.0x核"
 
 
 class TestDingTalkSign:
@@ -173,3 +175,15 @@ class TestDingTalkSign:
         assert "access_token=abc" in url
         assert "timestamp=" in url
         assert "sign=" in url
+
+
+class TestSilence:
+    def test_silence_active_by_epoch(self, monkeypatch):
+        monkeypatch.setattr("alerting.config.SILENCE_UNTIL", str(4102444800))  # 2100 年
+        assert _silence_active() is True
+        monkeypatch.setattr("alerting.config.SILENCE_UNTIL", "1")  # 1970 年
+        assert _silence_active() is False
+
+    def test_silence_inactive_when_unset(self, monkeypatch):
+        monkeypatch.setattr("alerting.config.SILENCE_UNTIL", "")
+        assert _silence_active() is False

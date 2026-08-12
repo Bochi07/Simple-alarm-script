@@ -36,6 +36,7 @@ from pathlib import Path
 
 import psutil
 
+import config
 from alerting import (
     PUSH_ABORT,
     AlertEngine,
@@ -53,7 +54,6 @@ from config import (
     ALERT_HISTORY_FILE,
     ALERT_STATE_FILE,
     COLLECT_INTERVAL,
-    DINGTALK_WEBHOOK,
     LOG_ALERT_MAX_SAMPLES,
     LOG_BACKUPS,
     LOG_FILE,
@@ -74,6 +74,7 @@ latest_snapshot = None
 _shutdown = asyncio.Event()
 _pid_fd = None
 _watchdog_forced = False
+_reload_requested = False
 
 # 看门狗宽限：收到关闭信号后，等待主循环自然退出的秒数；超时则强制取消并停循环
 WATCHDOG_GRACE_SECONDS = 3.0
@@ -182,7 +183,7 @@ async def metrics_loop(state_store: StateStore) -> None:
                     alert["metric"], alert["level"],
                 )
                 pushed = await push_alert_async(alert)
-                if pushed or not DINGTALK_WEBHOOK:
+                if pushed or not config.notify_configured():
                     # 推送成功（或未配置 Webhook 已留痕）后确认状态迁移；
                     # 未配置 Webhook 时无需每轮重复写留痕。
                     engine.confirm_delivered(alert)
@@ -202,22 +203,39 @@ async def metrics_loop(state_store: StateStore) -> None:
 # ================= 日志监控循环 =================
 async def logwatch_loop(state_store: StateStore) -> None:
     """关键错误日志语义监控循环：同代码事件聚合 + 冷却去抖，避免告警风暴。"""
+    global _reload_requested
     engine = LogSemanticEngine(socket.gethostname())
     cooldown = Cooldown(ALERT_COOLDOWN, store=state_store, prefix="logcooldown")
     tracker = LogRecoveryTracker(store=state_store)
     while not _shutdown.is_set():
+        if _reload_requested:
+            _reload_requested = False
+            import config as cfg
+            problems = cfg.reload_config()
+            for level, msg in problems:
+                if level == "fatal":
+                    logger.error("配置重载失败: [%s] %s", level, msg)
+                else:
+                    logger.warning("配置重载: [%s] %s", level, msg)
+            # 服务/日志清单可能变化：重建 watcher（阈值由 alerting 动态读取）
+            engine = LogSemanticEngine(socket.gethostname())
+            logger.info("配置重载完成，日志监控引擎已重建")
         if latest_snapshot is None:
             # 等待首个指标快照，保证日志联动诊断有数据可用
             if await _sleep_or_shutdown(1):
                 break
             continue
         try:
-            events = await engine.poll_once_async(latest_snapshot)
+            events, cmd_active, cmd_recovered = await engine.poll_once_async(latest_snapshot)
             grouped: dict[str, list] = {}
             for ev in events:
                 grouped.setdefault(ev["code"], []).append(ev)
             seen_codes = set(grouped.keys())
             now = time.time()
+
+            # 命令型状态仍存在：持续标记活跃，阻止事件型“冷却窗口无新命中”误判恢复
+            for code in cmd_active:
+                tracker.mark_seen(code, now)
 
             for code, group in grouped.items():
                 tracker.mark_seen(code, now)
@@ -243,12 +261,34 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 }
                 logger.error("命中关键日志 %s（%d 条），已聚合推送", code, len(group))
                 tracker.persist_seen(code, now)
-                if not await push_alert_async(alert) and DINGTALK_WEBHOOK:
+                if not await push_alert_async(alert) and config.notify_configured():
                     cooldown.clear(f"log:{code}")
 
             # 恢复判定：冷却窗口内无新命中 -> 发送一次“已恢复”通知
             for code in tracker.active_codes():
-                if code in seen_codes:
+                if code in seen_codes or code in cmd_active:
+                    continue
+                if code in cmd_recovered:
+                    # 命令型：状态已从输出中消失，立即按“已恢复”处理（仍过冷却去抖）
+                    if not cooldown.allowed(f"logrec:{code}"):
+                        continue
+                    alert = {
+                        "metric": f"log:{code}",
+                        "hostname": socket.gethostname(),
+                        "timestamp": utc_now_iso(),
+                        "value": "命令输出中已不再命中该状态",
+                        "threshold": "-",
+                        "level": "Recovery",
+                        "unit": "-",
+                        "advice": "命令型日志的异常状态已从输出中消失，判定恢复正常。请确认对应服务/容器状态。",
+                        "diagnosis": "命令输出中该状态行已消失（状态快照恢复）。",
+                    }
+                    logger.info("命令型日志状态 %s 已从输出消失，发送恢复通知", code)
+                    pushed = await push_alert_async(alert)
+                    if pushed or not config.notify_configured():
+                        tracker.mark_recovered(code)
+                    elif config.notify_configured():
+                        cooldown.clear(f"logrec:{code}")
                     continue
                 if not tracker.should_recover(code, now):
                     continue
@@ -267,9 +307,9 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 }
                 logger.info("日志事件 %s 已恢复（%ss 内无新命中）", code, ALERT_COOLDOWN)
                 pushed = await push_alert_async(alert)
-                if pushed or not DINGTALK_WEBHOOK:
+                if pushed or not config.notify_configured():
                     tracker.mark_recovered(code)
-                elif DINGTALK_WEBHOOK:
+                elif config.notify_configured():
                     cooldown.clear(f"logrec:{code}")
         except Exception as exc:
             logger.exception("日志监控循环异常: %s", exc)
@@ -295,6 +335,13 @@ def _request_shutdown(sig) -> None:
     logger.info("收到信号 %s，正在优雅退出…", sig)
     PUSH_ABORT.set()  # 打断推送线程的退避等待，加快退出
     _shutdown.set()
+
+
+def _handle_reload(_sig, _frame) -> None:
+    """SIGHUP：标记下一轮重载配置（阈值/服务/日志清单），由 logwatch 循环安全执行。"""
+    global _reload_requested
+    _reload_requested = True
+    logger.info("收到 SIGHUP，标记配置重载（下一轮生效）")
 
 
 def _handle_signal(sig, _frame) -> None:
@@ -354,6 +401,10 @@ def _run_main_loop() -> None:
                 loop.add_signal_handler(sig, _request_shutdown, sig)
             except (NotImplementedError, RuntimeError):
                 signal.signal(sig, _handle_signal)
+        try:
+            loop.add_signal_handler(signal.SIGHUP, _handle_reload)
+        except (NotImplementedError, RuntimeError, AttributeError):
+            signal.signal(signal.SIGHUP, _handle_reload)
         try:
             loop.run_until_complete(run())
         except RuntimeError as exc:
@@ -451,7 +502,7 @@ def main() -> None:
         logger.info(
             "监控告警中间件启动：指标周期 %ss，日志轮询周期 %ss，Webhook=%s",
             COLLECT_INTERVAL, LOG_SCAN_INTERVAL,
-            "已配置" if DINGTALK_WEBHOOK else "未配置(仅留痕)",
+            "已配置" if config.notify_configured() else "未配置(仅留痕)",
         )
         _run_main_loop()
     finally:

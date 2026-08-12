@@ -1,6 +1,8 @@
 """日志监控单测：文件型 offset/轮转、命令型状态 diff、路径自动探测。"""
 from __future__ import annotations
 
+import os
+
 from log_monitor import CommandLogWatcher, FileLogWatcher, _resolve_log_path
 
 
@@ -27,6 +29,19 @@ class TestFileLogWatcher:
         assert len(events) == 1
         assert events[0].line == "line_new"
 
+    def test_rename_rotation_resets_offset_via_inode(self, tmp_path):
+        p = tmp_path / "app.log"
+        p.write_text("line1\n", encoding="utf-8")
+        watcher = FileLogWatcher(p, [("line", "CODE", "desc")])
+        assert watcher.poll("h") == []  # 已有内容视为已读（offset 到文件末尾）
+        # rename 轮转：新文件 inode 变化，且 size >= 旧 offset（纯 size 比较会漏读）
+        new_file = tmp_path / "app.log.rotated"
+        new_file.write_text("line_new_content\n", encoding="utf-8")
+        os.replace(new_file, p)
+        events = watcher.poll("h")
+        assert len(events) == 1
+        assert events[0].line == "line_new_content"
+
     def test_missing_file_no_crash(self):
         watcher = FileLogWatcher(None, [("x", "C", "d")])
         assert watcher.poll("h") == []
@@ -49,6 +64,30 @@ class TestCommandLogWatcherDiff:
         assert len(watcher.poll("h")) == 1
         f.write_text("B OOMKilled\n", encoding="utf-8")
         assert len(watcher.poll("h")) == 1  # 新行出现 -> 新事件
+
+    def test_recovery_by_state_disappearance(self, tmp_path):
+        f = tmp_path / "state.txt"
+        f.write_text("container-x OOMKilled\n", encoding="utf-8")
+        watcher = CommandLogWatcher(f"cat {f}", [("OOMKilled", "DOCKER_OOM_KILL", "oom")])
+        assert len(watcher.poll("h")) == 1
+        assert watcher.active_codes() == {"DOCKER_OOM_KILL"}
+        assert watcher.recovered_codes() == set()
+
+        # 状态行仍在（即使内容微调）：仍活跃，不触发恢复
+        f.write_text("container-x OOMKilled again\n", encoding="utf-8")
+        assert len(watcher.poll("h")) == 1
+        assert watcher.active_codes() == {"DOCKER_OOM_KILL"}
+        assert watcher.recovered_codes() == set()
+
+        # 状态行从输出消失：恢复信号出现
+        f.write_text("container-x running\n", encoding="utf-8")
+        assert len(watcher.poll("h")) == 0
+        assert watcher.active_codes() == set()
+        assert watcher.recovered_codes() == {"DOCKER_OOM_KILL"}
+
+        # 恢复信号只报一次
+        assert len(watcher.poll("h")) == 0
+        assert watcher.recovered_codes() == set()
 
 
 class TestResolveLogPath:

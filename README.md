@@ -294,6 +294,9 @@ tail -f ~/.local/state/monitor-agent/alerts.jsonl   # 看留痕（systemd 下在
 | `MONITOR_DIAGNOSTICS` | 内置两条 | 日志语义诊断规则 JSON 数组（默认含 Nginx 网关过载 / Docker OOM） |
 | `DINGTALK_WEBHOOK` | 空 | 钉钉机器人 Webhook，空则仅本地留痕 |
 | `DINGTALK_SECRET` | 空 | 钉钉加签密钥 |
+| `WECOM_WEBHOOK` | 空 | 企业微信机器人 Webhook（配置后优先于钉钉） |
+| `FEISHU_WEBHOOK` | 空 | 飞书机器人 Webhook（未配置钉钉/企业微信时生效） |
+| `MONITOR_NOTIFY_STDOUT` | 0 | 1 时告警仅打印到 stdout（配合 journald / 调试） |
 | `MONITOR_INTERVAL` | 60 | 指标采集周期（秒） |
 | `LOG_SCAN_INTERVAL` | 10 | 日志轮询周期（秒） |
 | `ALERT_COOLDOWN` | 300 | 同类型告警冷却（秒） |
@@ -315,6 +318,8 @@ tail -f ~/.local/state/monitor-agent/alerts.jsonl   # 看留痕（systemd 下在
 | `SKIP_NOTIFY_FILE` | 状态目录/`skip-notified.json` | SKIP 一次性通知标记 |
 | `SKIP_NOTIFY_ONCE` | 1 | 是否启用 SKIP 首次通知（0 关闭） |
 | `STARTUP_NOTIFY` | 1 | 是否发送开机状态播报（0 关闭，回退为仅 SKIP 通知） |
+| `MONITOR_SILENCE_UNTIL` | 空 | 全局静默截止时间（Unix epoch 秒或 ISO8601），期内只留痕不推送 |
+| `MONITOR_SILENCE_SERVICES` | 空 | 逗号分隔的服务名，期内这些服务的告警只留痕不推送 |
 | `MONITOR_LOG_FILE` | 状态目录/`monitor-agent.log` | 运行日志文件（设空串则仅 stdout，供 journald） |
 | `MONITOR_LOG_MAX_BYTES` | 5242880 | 运行日志轮转阈值（字节） |
 | `MONITOR_LOG_BACKUPS` | 2 | 运行日志备份数 |

@@ -26,20 +26,18 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import config
 from collectors import MetricSnapshot, await_executor_future, utc_now_iso
 from config import (
     ALERT_COOLDOWN,
     ALERT_HISTORY_BACKUPS,
     ALERT_HISTORY_FILE,
     ALERT_HISTORY_MAX_BYTES,
-    DINGTALK_SECRET,
-    DINGTALK_WEBHOOK,
     PUSH_MAX_RETRIES,
     PUSH_RETRY_BACKOFF,
     PUSH_TIMEOUT,
     SKIP_NOTIFY_FILE,
     SKIP_NOTIFY_ONCE,
-    THRESHOLDS,
 )
 
 logger = logging.getLogger("monitor.alert")
@@ -87,7 +85,7 @@ _OPS_ADVICE = {
     "cpu_percent": "排查高占用进程：ps -eo pid,user,%cpu,comm --sort=-%cpu | head -20；"
                    "如为业务异常请重启相关服务。",
     "memory_percent": "检查内存占用：free -h；定位大内存进程：top -o %MEM；"
-                      "谨慎清理缓存：sync && echo 3 > /proc/sys/vm/drop_caches；必要时扩容。",
+                      "如为缓存膨胀可等待内核自动回收；持续紧张请优化业务内存使用或扩容。",
     "disk_percent": "清理日志：find /var/log -type f -name '*.log' -size +100M -delete；"
                     "定位大目录：du -sh /var/log/* | sort -rh | head -20。",
     "temperature_c": "检查散热与负载：sensors；降低负载或检查风扇，防止硬件降频损坏。",
@@ -148,7 +146,7 @@ class StateStore:
 
 def _level_for(metric: str, value: float) -> str | None:
     """依据阈值规则返回告警级别；未超阈值返回 None。"""
-    rule = THRESHOLDS.get(metric)
+    rule = config.THRESHOLDS.get(metric)
     if not rule:
         return None
     if metric == "load1":
@@ -267,11 +265,12 @@ def _sign(url: str, secret: str) -> str:
     return f"{url}&timestamp={timestamp}&sign={_compute_sign(secret, timestamp)}"
 
 
-def _build_alert_payload(alert: dict) -> str:
-    """构造钉钉 markdown 消息 JSON 体：左对齐、字段加粗、状态用色点圆圈。
+def _render_alert(alert: dict) -> tuple[str, str]:
+    """渲染告警的 (标题, 正文)，所有通知渠道共用。
 
-    告警 dict 可携带可选字段 body（已排版好的复合内容，如开机播报/SKIP 明细/
-    日志样本）；没有 body 时按 指标/当前值/触发阈值 标准字段渲染。
+    正文左对齐、字段加粗、状态仅用色点圆圈（🟢/🔴/🟡）；告警 dict 可携带可选字段
+    body（已排版好的复合内容，如开机播报/SKIP 明细/日志样本），没有 body 时按
+    指标/当前值/触发阈值 标准字段渲染。
     """
     label = _display_metric(alert["metric"])
     if alert["level"] == "Recovery":
@@ -301,10 +300,33 @@ def _build_alert_payload(alert: dict) -> str:
     if alert.get("diagnosis"):
         lines += ["", f"**根因诊断**：{alert['diagnosis']}"]
     lines += ["", "**建议措施**", f"> {alert['advice']}"]
-    text = "\n".join(lines)
+    return title, "\n".join(lines)
+
+
+def _build_alert_payload(alert: dict) -> str:
+    """钉钉 markdown 消息 JSON 体。"""
+    title, text = _render_alert(alert)
     return json.dumps({
         "msgtype": "markdown",
         "markdown": {"title": title, "text": text},
+    }, ensure_ascii=False)
+
+
+def _payload_wecom(alert: dict) -> str:
+    """企业微信机器人 markdown 消息 JSON 体。"""
+    _title, text = _render_alert(alert)
+    return json.dumps({"msgtype": "markdown", "markdown": {"content": text}}, ensure_ascii=False)
+
+
+def _payload_feishu(alert: dict) -> str:
+    """飞书机器人 interactive 卡片 JSON 体。"""
+    title, text = _render_alert(alert)
+    return json.dumps({
+        "msg_type": "interactive",
+        "card": {
+            "header": {"title": {"tag": "plain_text", "content": title}},
+            "elements": [{"tag": "markdown", "content": text}],
+        },
     }, ensure_ascii=False)
 
 
@@ -396,7 +418,7 @@ async def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str
     }
     logger.warning("首次启动发现 SKIP 服务 %s，发送一次性通知", names)
     pushed = await _push_in_executor(alert)
-    if pushed or not DINGTALK_WEBHOOK:
+    if pushed or not config.notify_configured():
         _mark_skip_notified(names)
         return True
     return False
@@ -414,12 +436,21 @@ def _build_startup_report(snapshot: MetricSnapshot) -> tuple[str, str]:
     skipped = [n for n, s in services.items() if s == "SKIP"]
     err_detail = {e["service"]: e.get("detail", "") for e in snapshot.service_errors}
 
+    if snapshot.disks:
+        disk_part = " ｜ ".join(f"{d['path']} {d['percent']:.1f}%" for d in snapshot.disks)
+    else:
+        disk_part = f"{snapshot.disk_percent:.1f}%"
+    temp_part = f"{snapshot.temperature_c:.1f}℃"
+    temp_src = getattr(snapshot, "temperature_source", "") or ""
+    if temp_src and temp_src != "none":
+        temp_part += f"（{temp_src}）"
+
     body_lines = ["**系统指标**", ""]
     body_lines.append(
         f"- CPU：{snapshot.cpu_percent:.1f}% ｜ 内存：{snapshot.memory_percent:.1f}% ｜ "
-        f"磁盘：{snapshot.disk_percent:.1f}%"
+        f"磁盘：{disk_part}"
     )
-    body_lines.append(f"- 负载：{snapshot.load1:.2f} ｜ 温度：{snapshot.temperature_c:.1f}℃")
+    body_lines.append(f"- 负载：{snapshot.load1:.2f} ｜ 温度：{temp_part}")
     body_lines += ["", "**服务状态**"]
     if services:
         for name in sorted(services):
@@ -441,8 +472,7 @@ def _build_startup_report(snapshot: MetricSnapshot) -> tuple[str, str]:
 
     value = (
         f"CPU {snapshot.cpu_percent:.1f}% / 内存 {snapshot.memory_percent:.1f}% / "
-        f"磁盘 {snapshot.disk_percent:.1f}% / 负载 {snapshot.load1:.2f} / "
-        f"温度 {snapshot.temperature_c:.1f}℃"
+        f"磁盘 {disk_part} / 负载 {snapshot.load1:.2f} / 温度 {temp_part}"
     )
     return value, "\n".join(body_lines)
 
@@ -479,7 +509,7 @@ async def notify_startup_report(snapshot: MetricSnapshot) -> bool:
     }
     logger.warning("发送开机启动播报（UP=%d DOWN=%d SKIP=%d）", len(up), len(down), len(skipped))
     pushed = await _push_in_executor(alert)
-    if pushed or not DINGTALK_WEBHOOK:
+    if pushed or not config.notify_configured():
         # 播报已覆盖 SKIP 信息：标记已通知，避免 SKIP 一次性通知重复发送
         if SKIP_NOTIFY_ONCE and skipped:
             _mark_skip_notified(skipped)
@@ -500,39 +530,67 @@ async def push_alert_async(alert: dict) -> bool:
 
 
 def _push_once(url: str, body: bytes) -> bool:
-    """单次 HTTP 推送，返回钉钉是否受理成功。"""
+    """单次 HTTP 推送，返回通知渠道是否受理成功（兼容钉钉/企业微信/飞书返回体）。"""
     req = urllib.request.Request(
         url,
         data=body,
         headers={
             "Content-Type": "application/json",
             # 部分企业代理/网关会拦截默认 Python-urllib UA，显式声明来源
-            "User-Agent": "monitor-agent/1.0",
+            "User-Agent": f"monitor-agent/{config.__version__}",
         },
     )
     with urllib.request.urlopen(req, timeout=PUSH_TIMEOUT) as resp:
         ret = json.loads(resp.read().decode("utf-8"))
-        ok = ret.get("errcode", -1) == 0
+        if isinstance(ret, dict):
+            if "errcode" in ret:
+                ok = ret.get("errcode") == 0
+            elif "code" in ret:
+                ok = ret.get("code") in (0, "0")
+            else:
+                ok = True
+        else:
+            ok = True
         if not ok:
-            logger.error("钉钉返回失败: %s", ret)
+            logger.error("通知渠道返回失败: %s", ret)
         return ok
 
 
+def _silence_active() -> bool:
+    """静默期内只留痕不推送（MONITOR_SILENCE_UNTIL，支持 epoch 秒或 ISO8601）。"""
+    ts = config.parse_silence_until(config.SILENCE_UNTIL)
+    return ts is not None and time.time() < ts
+
+
 def push_alert(alert: dict) -> bool:
-    """推送单条告警到钉钉（指数退避重试）；Webhook 未配置时仅本地留痕。"""
+    """推送单条告警到配置的通知渠道（指数退避重试）；无渠道或静默期仅本地留痕。"""
     _record_alert(alert)
-    if not DINGTALK_WEBHOOK or "REPLACE_ME" in DINGTALK_WEBHOOK:
-        logger.warning("钉钉 Webhook 未配置，已本地留痕（%s）", alert["metric"])
+    if _silence_active():
+        logger.info("静默期内（MONITOR_SILENCE_UNTIL），告警仅本地留痕: %s", alert["metric"])
+        return True
+    if config.MONITOR_NOTIFY_STDOUT:
+        title, text = _render_alert(alert)
+        print(f"[{alert['level']}] {title}\n{text}", flush=True)
+        return True
+    if config.WECOM_WEBHOOK:
+        url = config.WECOM_WEBHOOK
+        body = _payload_wecom(alert).encode("utf-8")
+    elif config.FEISHU_WEBHOOK:
+        url = config.FEISHU_WEBHOOK
+        body = _payload_feishu(alert).encode("utf-8")
+    elif config.DINGTALK_WEBHOOK and "REPLACE_ME" not in config.DINGTALK_WEBHOOK:
+        url = _sign(config.DINGTALK_WEBHOOK, config.DINGTALK_SECRET) if config.DINGTALK_SECRET else config.DINGTALK_WEBHOOK
+        body = _build_alert_payload(alert).encode("utf-8")
+    else:
+        logger.warning("未配置通知渠道，已本地留痕（%s）", alert["metric"])
         return False
-    url = _sign(DINGTALK_WEBHOOK, DINGTALK_SECRET) if DINGTALK_SECRET else DINGTALK_WEBHOOK
-    body = _build_alert_payload(alert).encode("utf-8")
     attempt = 0
     while True:
         try:
             if _push_once(url, body):
                 return True
         except Exception as exc:
-            logger.error("钉钉推送异常(第 %d 次): %s", attempt + 1, exc)
+            logger.error("通知推送异常(第 %d 次): %s", attempt + 1, exc)
         attempt += 1
         if attempt > PUSH_MAX_RETRIES:
             logger.error("推送失败已达上限，放弃 %s（已留痕，可后续补发）", alert["metric"])
@@ -566,10 +624,12 @@ class AlertEngine:
         for metric, field in _METRIC_FIELD.items():
             value = float(getattr(snapshot, field))
             level = _level_for(metric, value)
-            rule = THRESHOLDS[metric]
+            rule = config.THRESHOLDS[metric]
             prev = self._last_levels.get(metric)
             if metric == "load1":
-                value_text = f"{value:.2f}"
+                cores = max(os.cpu_count() or 1, 1)
+                norm = value / cores
+                value_text = f"{norm:.2f}x核（原始负载 {value:.2f}）"
                 threshold_text = f"Warning:{rule['warning']}x核 / Critical:{rule['critical']}x核"
             else:
                 value_text = f"{value:.1f}{rule['unit']}"
@@ -621,7 +681,7 @@ class AlertEngine:
             pct = float(disk["percent"])
             metric = f"disk:{path}"
             level = _level_for("disk_percent", pct)
-            rule = THRESHOLDS["disk_percent"]
+            rule = config.THRESHOLDS["disk_percent"]
             prev = self._last_levels.get(metric)
             if level:
                 if level != prev:
@@ -660,6 +720,8 @@ class AlertEngine:
                     self._store.set(f"metric:{metric}", "ok")
 
         for err in snapshot.service_errors:
+            if err["service"] in config.SILENCE_SERVICES:
+                continue
             alert = {
                 "metric": f"service:{err['service']}",
                 "hostname": snapshot.hostname,
@@ -675,6 +737,8 @@ class AlertEngine:
 
         # 服务恢复：DOWN -> UP / SKIP 时发送一次恢复通知；状态迁移等推送确认后再落盘
         for name, status in snapshot.services.items():
+            if name in config.SILENCE_SERVICES:
+                continue
             prev = self._last_services.get(name)
             if prev == "DOWN" and status != "DOWN":
                 alert = {

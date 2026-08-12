@@ -24,7 +24,8 @@ from pathlib import Path
 
 import psutil
 
-from config import COLLECT_WORKERS, DISK_PATHS, SERVICES
+import config
+from config import COLLECT_WORKERS
 
 logger = logging.getLogger("monitor.collect")
 
@@ -71,6 +72,7 @@ class MetricSnapshot:
     services: dict = field(default_factory=dict)      # {服务名: UP/DOWN}
     service_errors: list = field(default_factory=list)
     disks: list = field(default_factory=list)          # [{path, percent, used_gb, total_gb}]
+    temperature_source: str = ""                       # 温度传感器来源（coretemp 等）
 
 
 def utc_now_iso() -> str:
@@ -181,7 +183,7 @@ def get_disk_usage(path: str = "/") -> dict:
 def get_disk_usage_all() -> list:
     """按 DISK_PATHS 采集各挂载点磁盘占用；单个路径不可用跳过，不影响其他挂载点。"""
     disks = []
-    for path in DISK_PATHS:
+    for path in config.DISK_PATHS:
         try:
             du = psutil.disk_usage(path)
             disks.append({
@@ -196,15 +198,28 @@ def get_disk_usage_all() -> list:
 
 
 # ================= 温度 =================
-def get_temperature() -> float:
-    """优先 psutil.sensors_temperatures()，回退 /sys/class/thermal。"""
+_CPU_TEMP_GROUPS = ("coretemp", "k10temp", "zenpower", "cpu_thermal", "cpu-thermal", "x86_pkg_temp")
+
+
+def get_temperature() -> tuple[float, str]:
+    """返回 (温度, 来源)。优先 CPU 传感器（coretemp/k10temp 等），避免把主板/
+    显卡等无关传感器取 max 造成误报；无 CPU 传感器时回退任意传感器与 /sys/class/thermal。"""
     try:
         temps = psutil.sensors_temperatures()
         if temps:
-            for group in temps.values():
-                values = [e.current for e in group if e.current is not None]
+            for group in _CPU_TEMP_GROUPS:
+                values = [e.current for e in temps.get(group, []) if e.current is not None]
                 if values:
-                    return round(max(values), 1)
+                    return round(max(values), 1), group
+            all_values = [
+                (e.current, group)
+                for group, entries in temps.items()
+                for e in entries
+                if e.current is not None
+            ]
+            if all_values:
+                top = max(all_values, key=lambda item: item[0])
+                return round(top[0], 1), top[1]
     except Exception:
         pass
     if THERMAL_ZONE_DIR.is_dir():
@@ -215,8 +230,8 @@ def get_temperature() -> float:
             except Exception:
                 continue
         if temps:
-            return round(max(temps), 1)
-    return -1.0  # 无温度传感器
+            return round(max(temps), 1), "thermal_zone"
+    return -1.0, "none"  # 无温度传感器
 
 
 # ================= 服务存活性 =================
@@ -346,9 +361,10 @@ def _collect_sync() -> MetricSnapshot:
     disks = get_disk_usage_all()
     disk = max(disks, key=lambda d: d["percent"]) if disks else {"percent": 0.0, "used_gb": 0.0, "total_gb": 0.0}
     load1, load5, load15 = get_loadavg()
+    temperature_c, temperature_source = get_temperature()
 
     services, service_errors = {}, []
-    for svc in SERVICES:
+    for svc in config.SERVICES:
         name = svc["name"]
         try:
             status, detail = check_service(svc)
@@ -373,7 +389,8 @@ def _collect_sync() -> MetricSnapshot:
         disk_percent=disk["percent"],
         disk_used_gb=disk["used_gb"],
         disk_total_gb=disk["total_gb"],
-        temperature_c=get_temperature(),
+        temperature_c=temperature_c,
+        temperature_source=temperature_source,
         services=services,
         service_errors=service_errors,
         disks=disks,

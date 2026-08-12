@@ -19,11 +19,12 @@ import re
 import shutil
 import socket
 import subprocess
+from collections import deque
 from pathlib import Path
 
+import config
 from collectors import EXECUTOR as COLLECT_EXECUTOR
 from collectors import MetricSnapshot, _find_binary, await_executor_future, utc_now_iso
-from config import COMMAND_SHELL, DIAGNOSTICS, LOG_COMMAND_TIMEOUT, LOG_JOBS, THRESHOLDS
 
 logger = logging.getLogger("monitor.logwatch")
 
@@ -119,14 +120,30 @@ class FileLogWatcher:
         self.name = name
         self.path = path
         self.patterns = [(re.compile(p), code, desc) for p, code, desc in patterns]
-        self.offset = self.path.stat().st_size if self.path is not None and self.path.is_file() else 0
+        self.offset = 0
+        self._ino: int | None = None
+        if self.path is not None and self.path.is_file():
+            try:
+                st = self.path.stat()
+                self._ino = st.st_ino
+                self.offset = st.st_size  # 初始视为已读，不告警历史日志
+            except OSError:
+                pass
 
     def poll(self, hostname: str) -> list:
         # 文件不存在/是目录/被删时直接返回空，等文件恢复后再监控（避免每轮异常刷屏）
         if self.path is None or not self.path.is_file():
             return []
-        size = self.path.stat().st_size
-        if size < self.offset:      # 日志被截断或轮转，重置偏移
+        try:
+            st = self.path.stat()
+        except OSError:
+            return []
+        # rename 轮转：inode 变化说明换了个新文件，从头读取
+        if self._ino is not None and st.st_ino != self._ino:
+            self.offset = 0
+        self._ino = st.st_ino
+        size = st.st_size
+        if size < self.offset:      # copytruncate 截断或文件变小，重置偏移
             self.offset = 0
         if size == self.offset:
             return []
@@ -146,16 +163,18 @@ class FileLogWatcher:
 class CommandLogWatcher:
     """命令型日志轮询器：定时执行命令并全文匹配（如 docker ps -a）。
 
-    采用“状态快照 diff”：只对**本轮新出现**的命中行产生事件，已出现过的行
-    不再重复触发。这样 docker ps 等全量快照类命令，即使容器持续处于
-    OOMKilled 状态，也不会每轮（或每个冷却周期）重复推送告警。
+    命令输出被当作“当前状态快照”：只对**本轮新出现**的命中行产生事件，
+    已出现过的行不再重复触发。恢复以“状态从输出中消失”为准——通过
+    active_codes() / recovered_codes() 暴露当前仍命中与刚消失的代码，
+    由调用方做持续状态型恢复判定，避免事件型“冷却窗口无新命中”误报恢复。
     """
 
     def __init__(self, command: str, patterns: list):
         self.command = command
         self.patterns = [(re.compile(p), code, desc) for p, code, desc in patterns]
-        self._last_matched: set[str] = set()
-        self._state_max = 500  # 有界保留最近命中行，防止长期运行内存无限增长
+        self._seen: deque[str] = deque(maxlen=500)  # 最近命中行（有界，防内存增长）
+        self._active_codes: set[str] = set()        # 本轮输出中仍命中的 code
+        self._recovered_codes: set[str] = set()     # 上轮命中、本轮消失的 code
         first = command.split()[0] if command.split() else ""
         self._shell = _resolve_shell()
         self._missing = False
@@ -176,10 +195,12 @@ class CommandLogWatcher:
         try:
             out = subprocess.run(
                 [self._shell, "-c", self.command],
-                capture_output=True, text=True, timeout=LOG_COMMAND_TIMEOUT,
+                capture_output=True, text=True, timeout=config.LOG_COMMAND_TIMEOUT,
             ).stdout
         except Exception as exc:
             logger.warning("日志命令执行失败 %s: %s", self.command, exc)
+            # 命令失败不代表状态恢复：保留活跃集合，清空恢复信号，避免误报
+            self._recovered_codes = set()
             return []
         events = []
         seen: set[str] = set()
@@ -193,16 +214,31 @@ class CommandLogWatcher:
                 if rx.search(line):
                     matched.add(line)
                     break
-        new_lines = matched - self._last_matched
-        if len(self._last_matched) > self._state_max:
-            self._last_matched = set(sorted(self._last_matched)[-self._state_max:])
-        self._last_matched = self._last_matched | matched
+        new_lines = matched - set(self._seen)
+        for line in sorted(new_lines):
+            self._seen.append(line)
+        active = set()
+        for line in matched:
+            for rx, code, desc in self.patterns:
+                if rx.search(line):
+                    active.add(code)
+                    break
+        self._recovered_codes = self._active_codes - active
+        self._active_codes = active
         for line in sorted(new_lines):
             for rx, code, desc in self.patterns:
                 if rx.search(line):
                     events.append(LogEvent(code, desc, self.command, line, hostname))
                     break
         return events
+
+    def active_codes(self) -> set[str]:
+        """当前命令输出中仍命中的代码（持续状态告警的“仍活跃”依据）。"""
+        return set(self._active_codes)
+
+    def recovered_codes(self) -> set[str]:
+        """上轮输出命中、本轮已从输出消失的代码（持续状态告警的“已恢复”依据）。"""
+        return set(self._recovered_codes)
 
 
 def _resolve_shell() -> str | None:
@@ -211,8 +247,8 @@ def _resolve_shell() -> str | None:
     返回绝对路径；找不到任何可用 shell 时返回 None（调用方跳过命令型任务）。
     """
     candidates: list[str] = []
-    if COMMAND_SHELL:
-        candidates.append(COMMAND_SHELL)
+    if config.COMMAND_SHELL:
+        candidates.append(config.COMMAND_SHELL)
     candidates += ["/bin/bash", "/bin/sh"]
     for cand in candidates:
         if not cand:
@@ -235,7 +271,7 @@ class LogSemanticEngine:
 
     def _build_watchers(self) -> list:
         watchers: list = []
-        for job in LOG_JOBS:
+        for job in config.LOG_JOBS:
             try:
                 if "path" in job or "paths" in job:
                     resolved = _resolve_log_path(job)
@@ -248,33 +284,38 @@ class LogSemanticEngine:
                                  job.get("name", "?"), exc)
         return watchers
 
-    async def poll_once_async(self, snapshot: MetricSnapshot | None) -> list:
-        """异步轮询所有 watcher，返回带语义诊断的告警事件字典列表。
+    async def poll_once_async(self, snapshot: MetricSnapshot | None) -> tuple[list, set, set]:
+        """异步轮询所有 watcher，返回 (alerts, cmd_active, cmd_recovered)。
 
         命令型 watcher（subprocess）提交到采集线程池执行，避免 docker ps 等
-        阻塞命令卡住事件循环；单 watcher 异常不拖垮整轮。
+        阻塞命令卡住事件循环；单 watcher 异常不拖垮整轮。cmd_active 为命令型
+        当前仍命中的代码集合，cmd_recovered 为刚消失（应恢复）的代码集合。
         """
         alerts = []
+        cmd_active: set[str] = set()
+        cmd_recovered: set[str] = set()
         loop = asyncio.get_running_loop()
         for watcher in self.watchers:
             try:
                 if isinstance(watcher, CommandLogWatcher):
                     fut = loop.run_in_executor(COLLECT_EXECUTOR, watcher.poll, self.hostname)
                     events = await await_executor_future(fut)
+                    cmd_active |= watcher.active_codes()
+                    cmd_recovered |= watcher.recovered_codes()
                 else:
                     events = watcher.poll(self.hostname)
                 for ev in events:
                     alerts.append(self._decorate(ev, snapshot))
             except Exception as exc:
                 logger.exception("日志 watcher 轮询异常: %s", exc)
-        return alerts
+        return alerts, cmd_active, cmd_recovered
 
     def _decorate(self, ev: LogEvent, snapshot: MetricSnapshot | None) -> dict:
         base = ev.to_dict()
         base["timestamp"] = utc_now_iso()
         diag = None
         if snapshot is not None:
-            for rule in DIAGNOSTICS:
+            for rule in config.DIAGNOSTICS:
                 if rule["code"] == ev.code and self._match_diag(rule, snapshot):
                     diag = rule
                     break
@@ -286,7 +327,7 @@ class LogSemanticEngine:
     def _match_diag(rule: dict, snapshot: MetricSnapshot) -> bool:
         """资源条件全部满足才算命中（“双高”必须两个都高）。"""
         for metric, level in rule["when"].items():
-            threshold = THRESHOLDS.get(metric, {}).get(level)
+            threshold = config.THRESHOLDS.get(metric, {}).get(level)
             if threshold is None:
                 continue
             if float(getattr(snapshot, metric, 0.0)) < threshold:
@@ -300,7 +341,7 @@ if __name__ == "__main__":
 
     async def _demo() -> None:
         engine = LogSemanticEngine(socket.gethostname())
-        events = await engine.poll_once_async(None)
+        events, _cmd_active, _cmd_recovered = await engine.poll_once_async(None)
         print("本轮命中事件数:", len(events))
         for e in events:
             print(e)
