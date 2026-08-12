@@ -1,6 +1,6 @@
 [Unit]
 Description=Monitor Agent (metrics + log alerts)
-Documentation=file:__MONITOR_DIR__/DOCUMENTATION.md
+Documentation=file:__MONITOR_DIR__/README.md
 After=network-online.target
 Wants=network-online.target
 

@@ -11,7 +11,7 @@
 # 行为：
 #   1. 源目录自动定位为本脚本所在目录（克隆仓库后直接运行即可，不依赖固定路径）；
 #   2. 备份目标目录现有文件到 <目标目录>.bak-<时间戳>；
-#   3. 覆盖安装核心代码、README、DOCUMENTATION、配置示例、requirements 与 systemd 模板；
+#   3. 覆盖安装核心代码、README、配置示例、requirements 与 systemd 模板；
 #   4. 刷新 <目标目录>.zip 归档（若本机有 zip 命令，旧包同样留备份）；
 #   5. systemd 模式：注册 monitor-agent.service 开机自启并立即启动，
 #      同时生成 /etc/monitor-agent/env 密钥模板（root:root 0600）。
@@ -104,7 +104,7 @@ install_files() {
 
     cp -p "$SRC"/main.py "$SRC"/config.py "$SRC"/collectors.py \
           "$SRC"/alerting.py "$SRC"/log_monitor.py "$DST"/
-    cp -p "$SRC"/README.md "$SRC"/DOCUMENTATION.md "$DST"/
+    cp -p "$SRC"/README.md "$DST"/
     cp -p "$SRC"/requirements.txt "$SRC"/config.example.json "$DST"/
     mkdir -p "$DST"/deploy
     sed "s|__MONITOR_DIR__|${DST//&/\\&}|g" \
@@ -164,16 +164,16 @@ write_env_template() {
 DINGTALK_WEBHOOK=
 DINGTALK_SECRET=
 
-# 按主机启用服务/日志监控（三者任选其一，详见 DOCUMENTATION.md）
+# 按主机启用服务/日志监控（三者任选其一，详见 README.md）
 # MONITOR_CONFIG_FILE=/etc/monitor-agent/config.json
 # MONITOR_SERVICES=[{"name":"nginx","process_names":["nginx"],"port":80}]
 # MONITOR_LOG_JOBS=[{"name":"nginx_error","path":"/var/log/nginx/error.log","patterns":[["connect\\(\\) failed","NGINX_UPSTREAM_FAIL","Nginx 后端网关异常"]]}]
 
-# 采集与告警参数（可选，默认值见 DOCUMENTATION.md）
+# 采集与告警参数（可选，默认值见 README.md）
 # MONITOR_INTERVAL=60
 # LOG_SCAN_INTERVAL=10
 # ALERT_COOLDOWN=300
-# 阈值覆盖示例（默认见 DOCUMENTATION.md）
+# 阈值覆盖示例（默认见 README.md）
 # CPU_PERCENT_WARNING=85
 # CPU_PERCENT_CRITICAL=97
 # ALERT_STATE_FILE=/var/lib/monitor-agent/alert-state.json
