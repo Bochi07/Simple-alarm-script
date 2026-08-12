@@ -4,7 +4,22 @@
 探测服务存活，增量分析关键日志，命中异常即按 Warning / Critical 分级推送到钉钉。
 开箱即用、不假设任何业务，放到任意一台 Linux 机器上都能正常运行且不会误报。
 
-## 功能介绍
+---
+
+## 目录
+
+1. [功能介绍](#1-功能介绍)
+2. [架构介绍](#2-架构介绍)
+3. [从零部署](#3-从零部署)
+4. [后续更新](#4-后续更新)
+5. [卸载](#5-卸载)
+6. [常见问题排查](#6-常见问题排查)
+
+---
+
+## 1. 功能介绍
+
+### 1.1 解决的场景
 
 | 场景 | 能力 |
 |---|---|
@@ -12,7 +27,7 @@
 | 服务挂了没人知道 | 按进程、端口、Unix socket 探测服务存活，DOWN 立即告警，未安装自动跳过 |
 | 关键日志刷屏 | 增量轮询 Nginx / Docker 等日志，命中错误模式聚合推送，联动系统指标给出根因诊断 |
 
-主要特性：
+### 1.2 主要特性
 
 - **指标监控**：CPU（psutil + `/proc` 双通道）、内存、磁盘、负载、温度；
 - **分级阈值**：每个指标独立配置 Warning / Critical 两级，可经环境变量按主机覆盖；
@@ -29,13 +44,92 @@
 - **优雅退出**：SIGINT / SIGTERM 秒级退出，线程池收尾有超时上限；
 - **自检工具**：`python3 main.py --selftest` 部署前体检配置与运行环境。
 
-工作原理：进程启动后创建 asyncio 事件循环，并行运行两个协程——`metrics_loop`
-（指标采集 + 服务存活）与 `logwatch_loop`（日志语义）。所有阻塞 IO（1 秒 CPU 采样、
-socket 探测、子进程命令）和钉钉推送（含退避重试）都在独立线程中执行，不阻塞事件循环。
+---
 
-## 从零部署
+## 2. 架构介绍
 
-### 环境要求
+### 2.1 目录结构
+
+```text
+monitor-agent/
+├── main.py                       # 主入口：事件循环、信号处理、自检
+├── config.py                     # 全部配置：阈值、Webhook、服务/日志清单
+├── collectors.py                 # 指标采集 + 服务存活探测
+├── alerting.py                   # 阈值判定、冷却、钉钉推送、留痕、SKIP/开机播报通知
+├── log_monitor.py                # 日志语义监控（文件型 / 命令型）
+├── config.example.json           # 服务与日志监控配置示例（nginx + docker）
+├── requirements.txt              # 生产依赖（psutil）
+├── deploy/
+│   ├── monitor-agent.service.example        # systemd 标准模板（含 __MONITOR_DIR__ / __PYTHON_BIN__ 占位符）
+│   └── monitor-agent.service.legacy.example # systemd < 235（如 CentOS 7）兼容模板
+└── install.sh                    # 安装 / 更新 / 自启 / 卸载脚本（root）
+```
+
+模块职责：`config.py` 是所有配置的唯一来源（文件 + 环境变量合并，启动时统一体检）；
+`collectors.py` 产出统一快照 `MetricSnapshot`；`alerting.py` 消费快照做判定与推送；
+`log_monitor.py` 独立轮询日志并复用 `alerting.py` 的推送通道；`main.py` 负责编排
+两个循环、信号处理与退出收尾。
+
+### 2.2 工作原理
+
+进程启动后创建 asyncio 事件循环，并行运行两个协程：
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│ main.py（asyncio 事件循环，单进程常驻）                     │
+│                                                          │
+│  metrics_loop ─ 每 MONITOR_INTERVAL 秒                   │
+│     采集快照（阻塞部分放线程池）                            │
+│     ├─ 阈值判定 → Warning/Critical 告警 → 钉钉             │
+│     └─ 服务存活探测 → DOWN 告警 / SKIP 一次性通知 / 开机播报  │
+│                                                          │
+│  logwatch_loop ─ 每 LOG_SCAN_INTERVAL 秒                 │
+│     轮询日志 watcher → 正则命中 → 聚合 → 联动诊断 → 钉钉     │
+└──────────────────────────────────────────────────────────┘
+```
+
+关键机制：
+
+- **采集隔离**：阻塞 IO（`cpu_percent(interval=1)`、磁盘、socket 探测、子进程命令）
+  提交到应用自有线程池（`collectors.EXECUTOR`），事件循环不卡顿；退出时该线程池
+  有界收尾（默认 5 秒上限，`MONITOR_SHUTDOWN_TIMEOUT`）；
+- **推送隔离与重试**：钉钉推送（含退避重试）整体在独立线程中执行，网络抖动不阻塞
+  监控循环；失败按 `2s → 4s → 8s` 指数退避，仍失败则本轮放弃、下一轮重新触发；
+- **告警风暴抑制**：同指标同级别（`metric:level`）在冷却窗口内只推一次；
+  日志按代码（`log:<code>`）聚合 + 冷却；
+- **恢复通知可靠性**：指标/服务恢复时先生成恢复通知，**推送成功后才**把状态落盘为
+  “已恢复”；推送失败保持告警状态，下一轮重新生成，不会丢失；
+- **SKIP 判定**：服务配置了，但本机既无进程、无二进制、无 socket、无监听端口，
+  即判定“未安装”，不产生 DOWN 告警；
+- **单实例锁**：PID 文件采用 `O_EXCL` 创建 + 存活进程检测，第二个实例直接退出
+  （退出码 2），不会造成双份告警；
+- **优雅退出**：SIGINT / SIGTERM 触发 `_shutdown` 事件，推送退避等待可被打断，
+  主循环自然退出，超时由看门狗强制收尾。
+
+### 2.3 状态与留痕文件
+
+| 文件 | 用途 |
+|---|---|
+| `monitor-agent.pid` | 单实例锁（存活实例检测） |
+| `alerts.jsonl` | 全部告警留痕（自动轮转） |
+| `monitor-agent.log` | 运行日志（默认落盘，自动轮转） |
+| `alert-state.json` | 冷却 / 告警级别 / 服务状态持久化（重启续用） |
+| `skip-notified.json` | SKIP 一次性通知标记（删除可重新触发） |
+
+仓库内直接运行时位于 `~/.local/state/monitor-agent/`（可用 `MONITOR_STATE_DIR` 整体搬迁）；
+systemd 部署下由服务单元固定到：
+
+```text
+/run/monitor-agent/          PID 锁（运行时，重启即清）
+/var/lib/monitor-agent/      alerts.jsonl、skip-notified.json、alert-state.json（持久）
+/var/log/monitor-agent/      运行日志（轮转）
+```
+
+---
+
+## 3. 从零部署
+
+### 3.1 环境要求
 
 | 项 | 要求 |
 |---|---|
@@ -45,7 +139,7 @@ socket 探测、子进程命令）和钉钉推送（含退避重试）都在独�
 | 网络 | 仅出站 HTTPS，用于推送钉钉 |
 | 权限 | 读日志 / socket 需要 root；普通运行也能监控系统指标 |
 
-### 获取代码
+### 3.2 获取代码
 
 ```bash
 git clone git@github.com:Bochi07/Simple-alarm-script.git
@@ -53,7 +147,7 @@ cd Simple-alarm-script
 python3 -m pip install -r requirements.txt
 ```
 
-### 方式 A：仓库内直接运行（最快）
+### 3.3 方式 A：仓库内直接运行（最快）
 
 ```bash
 # 配置钉钉（可选；不配则告警仅本地留痕）
@@ -69,14 +163,14 @@ python3 main.py
 
 未配置 `DINGTALK_WEBHOOK` 时，告警只写入本地留痕文件，不推送钉钉。
 
-### 方式 B：安装到系统目录（推荐）
+### 3.4 方式 B：安装到系统目录（推荐）
 
 ```bash
 sudo bash install.sh
 ```
 
-脚本自动定位到仓库自身，默认安装到 `/opt/monitor-agent`，会先备份旧目录
-到 `/opt/monitor-agent.bak-<时间戳>` 再覆盖，并做语法检查。自定义位置：
+脚本自动定位到仓库自身，默认安装到 `/opt/monitor-agent`，会先备份旧目录到
+`/opt/monitor-agent.bak-<时间戳>` 再覆盖，并做语法检查。自定义位置：
 
 ```bash
 sudo MONITOR_AGENT_DIR=/usr/local/monitor-agent bash install.sh
@@ -88,7 +182,7 @@ sudo MONITOR_AGENT_DIR=/usr/local/monitor-agent bash install.sh
 python3 /opt/monitor-agent/main.py --selftest
 ```
 
-### 方式 C：systemd 开机自启（不占终端、root 运行）
+### 3.5 方式 C：systemd 开机自启（不占终端、root 运行）
 
 ```bash
 sudo bash install.sh systemd
@@ -107,7 +201,7 @@ systemctl restart monitor-agent
 journalctl -u monitor-agent -f
 ```
 
-### 创建钉钉机器人
+### 3.6 创建钉钉机器人
 
 1. 钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义（Webhook）；
 2. 安全设置建议开启**加签**，将 `SEC` 密钥填入 `DINGTALK_SECRET`；
@@ -121,7 +215,7 @@ sudo nano /etc/monitor-agent/env
 sudo systemctl restart monitor-agent
 ```
 
-### 启用业务监控（服务 / 日志）
+### 3.7 启用业务监控（服务 / 日志）
 
 默认只监控系统指标，不会误报。要监控 nginx、docker 等业务，任选一种方式注入清单：
 
@@ -166,7 +260,7 @@ export MONITOR_LOG_JOBS='[{"name":"nginx_error","path":"/var/log/nginx/error.log
 自动跳过（SKIP）：配置了但主机上完全没有安装痕迹（进程 / 二进制 / socket /
 监听端口）的服务判定为 SKIP，不产生 DOWN 告警，同一份配置可安全铺到一批异构主机上。
 
-### 部署验证清单
+### 3.8 部署验证清单
 
 ```bash
 python3 main.py --selftest                          # 配置/环境体检
@@ -176,7 +270,7 @@ tail -f ~/.local/state/monitor-agent/alerts.jsonl   # 看留痕（systemd 下在
 
 启动日志出现 `监控告警中间件启动：... Webhook=已配置` 即为正常。
 
-### 配置参考（环境变量）
+### 3.9 配置参考（环境变量）
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -209,9 +303,11 @@ tail -f ~/.local/state/monitor-agent/alerts.jsonl   # 看留痕（systemd 下在
 | `MONITOR_LOG_MAX_BYTES` | 5242880 | 运行日志轮转阈值（字节） |
 | `MONITOR_LOG_BACKUPS` | 2 | 运行日志备份数 |
 | `MONITOR_SHUTDOWN_TIMEOUT` | 5 | 退出时线程池收尾上限（秒） |
-| `ALERT_STATE_FILE` | 状态目录/`alert-state.json` | 冷却/级别/服务状态持久化文件 |
+| `ALERT_STATE_FILE` | 状态目录/`alert-state.json` | 冷却 / 级别 / 服务状态持久化文件 |
 
-## 后续更新
+---
+
+## 4. 后续更新
 
 代码更新后（`git pull` 拉到最新提交），重跑一次安装脚本即可，配置原样保留：
 
@@ -224,7 +320,9 @@ sudo bash install.sh systemd    # 覆盖安装 + 重建服务单元并重启
 旧代码会自动备份到 `/opt/monitor-agent.bak-<时间戳>`，`/etc/monitor-agent/env`
 不会被动过；如需回滚，把备份目录换回原位置并重启服务即可。
 
-## 卸载
+---
+
+## 5. 卸载
 
 ```bash
 sudo bash install.sh systemd-remove   # 只停服务，保留程序文件
@@ -238,7 +336,9 @@ sudo rm -rf /etc/monitor-agent /var/lib/monitor-agent /var/log/monitor-agent /ru
 rm -rf ~/.local/state/monitor-agent
 ```
 
-## 常见问题排查
+---
+
+## 6. 常见问题排查
 
 **Q1：启动报“配置不合法，启动中止”**
 
@@ -286,7 +386,7 @@ Docker 用 `unix_socket: /var/run/docker.sock`，不要依赖 2375 端口。
 **Q10：如何修改阈值？**
 
 用 `CPU_PERCENT_WARNING`、`MEMORY_PERCENT_CRITICAL` 等环境变量覆盖
-（见上方配置参考），systemd 方式写入 `/etc/monitor-agent/env` 后重启服务。
+（见 3.9 配置参考），systemd 方式写入 `/etc/monitor-agent/env` 后重启服务。
 
 **Q11：本地运行日志在哪里？**
 
