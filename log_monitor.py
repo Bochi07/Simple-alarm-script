@@ -1,0 +1,199 @@
+# -*- coding: utf-8 -*-
+"""
+日志语义监控：轮询关键日志，实时匹配 Nginx 502/504、Docker OOMKilled 等。
+
+支持两类日志源：
+  - 文件型（如 /var/log/nginx/error.log）：基于文件 offset 增量读取，只处理
+    新增行，避免重复告警；文件轮转/截断时自动重置偏移。
+  - 命令型（如 docker ps -a）：定时执行命令并全文正则匹配，同轮内重复行去重。
+
+联动诊断：命中关键日志后，结合最近一次系统指标快照，给出语义化根因判断
+（例如「Nginx 5xx + CPU/内存双高 -> 后端过载」）。
+诊断阈值统一引用 config.THRESHOLDS，避免多处硬编码漂移。
+"""
+from __future__ import annotations
+
+import logging
+import re
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+from config import LOG_JOBS, THRESHOLDS
+from collectors import MetricSnapshot, _find_binary
+
+logger = logging.getLogger("monitor.logwatch")
+
+
+class LogEvent:
+    """单条命中日志事件的标准化载体。"""
+
+    __slots__ = ("code", "description", "source", "line", "hostname")
+
+    def __init__(self, code, description, source, line, hostname):
+        self.code = code
+        self.description = description
+        self.source = source
+        self.line = line
+        self.hostname = hostname
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "description": self.description,
+            "source": self.source,
+            "line": self.line,
+            "hostname": self.hostname,
+        }
+
+
+class FileLogWatcher:
+    """文件型日志轮询器：offset 增量读取 + 正则匹配。"""
+
+    def __init__(self, path: str, patterns: list):
+        self.path = Path(path)
+        self.patterns = [(re.compile(p), code, desc) for p, code, desc in patterns]
+        self.offset = self.path.stat().st_size if self.path.is_file() else 0
+
+    def poll(self, hostname: str) -> list:
+        # 文件不存在/是目录/被删时直接返回空，等文件恢复后再监控（避免每轮异常刷屏）
+        if not self.path.is_file():
+            return []
+        size = self.path.stat().st_size
+        if size < self.offset:      # 日志被截断或轮转，重置偏移
+            self.offset = 0
+        if size == self.offset:
+            return []
+        events = []
+        with self.path.open("r", encoding="utf-8", errors="replace") as fp:
+            fp.seek(self.offset)
+            for raw in fp:
+                line = raw.rstrip("\n")
+                for rx, code, desc in self.patterns:
+                    if rx.search(line):
+                        events.append(LogEvent(code, desc, str(self.path), line, hostname))
+                        break
+            self.offset = fp.tell()
+        return events
+
+
+class CommandLogWatcher:
+    """命令型日志轮询器：定时执行命令并全文匹配（如 docker ps -a）。"""
+
+    def __init__(self, command: str, patterns: list):
+        self.command = command
+        self.patterns = [(re.compile(p), code, desc) for p, code, desc in patterns]
+        first = command.split()[0] if command.split() else ""
+        self._missing = bool(first) and _find_binary(first) is None
+        if self._missing:
+            logger.info("日志命令不存在，跳过该任务（%s 未安装）: %s", first, command)
+
+    def poll(self, hostname: str) -> list:
+        if self._missing:
+            return []
+        try:
+            out = subprocess.run(
+                ["/bin/bash", "-c", self.command],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+        except Exception as exc:
+            logger.warning("日志命令执行失败 %s: %s", self.command, exc)
+            return []
+        events = []
+        seen: set[str] = set()
+        for raw in out.splitlines():
+            line = raw.strip()
+            if not line or line in seen:
+                continue
+            seen.add(line)
+            for rx, code, desc in self.patterns:
+                if rx.search(line):
+                    events.append(LogEvent(code, desc, self.command, line, hostname))
+                    break
+        return events
+
+
+class LogSemanticEngine:
+    """日志语义诊断引擎：日志命中 + 系统指标联动分析。"""
+
+    # 语义化诊断规则：命中某日志代码，且满足全部资源条件 -> 输出诊断与建议。
+    # when 的值引用 THRESHOLDS 中的级别（warning / critical），统一阈值来源。
+    DIAGNOSTICS = [
+        {
+            "code": "NGINX_UPSTREAM_FAIL",
+            "when": {"cpu_percent": "warning", "memory_percent": "warning"},
+            "diagnosis": "Nginx 网关 5xx 与 CPU/内存水位双高，后端服务大概率过载或挂起，建议立即排查后端健康。",
+            "advice": "检查后端进程：systemctl status <backend>；查看日志：journalctl -u <backend> -n 100；"
+                      "关注连接数 ulimit 限制。",
+        },
+        {
+            "code": "DOCKER_OOM_KILL",
+            "when": {"memory_percent": "critical"},
+            "diagnosis": "检测到容器 OOMKilled 且主机内存达到 Critical 水位，存在资源争抢，建议调整容器内存限额。",
+            "advice": "查看限额：docker stats --no-stream；重新调度容器并设置 --memory / --memory-reservation。",
+        },
+    ]
+
+    def __init__(self, hostname: str):
+        self.hostname = hostname
+        self.watchers = self._build_watchers()
+
+    def _build_watchers(self) -> list:
+        watchers = []
+        for job in LOG_JOBS:
+            try:
+                if "path" in job:
+                    watchers.append(FileLogWatcher(job["path"], job["patterns"]))
+                else:
+                    watchers.append(CommandLogWatcher(job["command"], job["patterns"]))
+            except Exception as exc:
+                # 单个任务初始化失败（路径损坏/正则异常等）不拖垮整个监控进程
+                logger.exception("日志任务 %s 初始化失败，已跳过该任务: %s",
+                                 job.get("name", "?"), exc)
+        return watchers
+
+    def poll_once(self, snapshot: MetricSnapshot | None) -> list:
+        """轮询所有 watcher，返回带语义诊断的告警事件字典列表；单 watcher 异常不拖垮整轮。"""
+        alerts = []
+        for watcher in self.watchers:
+            try:
+                for ev in watcher.poll(self.hostname):
+                    alerts.append(self._decorate(ev, snapshot))
+            except Exception as exc:
+                logger.exception("日志 watcher 轮询异常: %s", exc)
+        return alerts
+
+    def _decorate(self, ev: LogEvent, snapshot: MetricSnapshot | None) -> dict:
+        base = ev.to_dict()
+        base["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        diag = None
+        if snapshot is not None:
+            for rule in self.DIAGNOSTICS:
+                if rule["code"] == ev.code and self._match_diag(rule, snapshot):
+                    diag = rule
+                    break
+        base["diagnosis"] = diag["diagnosis"] if diag else "暂未匹配到资源联动异常，请结合服务日志定位根因。"
+        base["advice"] = diag["advice"] if diag else "查看对应服务日志与系统资源现状。"
+        return base
+
+    @staticmethod
+    def _match_diag(rule: dict, snapshot: MetricSnapshot) -> bool:
+        """资源条件全部满足才算命中（“双高”必须两个都高）。"""
+        for metric, level in rule["when"].items():
+            threshold = THRESHOLDS.get(metric, {}).get(level)
+            if threshold is None:
+                continue
+            if float(getattr(snapshot, metric, 0.0)) < threshold:
+                return False
+        return True
+
+
+if __name__ == "__main__":
+    # 独立自检：单轮轮询演示
+    logging.basicConfig(level=logging.INFO)
+    engine = LogSemanticEngine(socket.gethostname())
+    events = engine.poll_once(None)
+    print("本轮命中事件数:", len(events))
+    for e in events:
+        print(e)

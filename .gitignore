@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地配置与密钥（绝不上传）
+.env
+.env.*
+!config.example.json
+
+# 运行产物：日志、告警留痕、状态、备份、打包
+*.log
+*.jsonl
+*.zip
+*.bak
+*.bak-*
+state/
+data/
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/

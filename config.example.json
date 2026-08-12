@@ -1,0 +1,41 @@
+{
+  "services": [
+    {
+      "name": "nginx",
+      "process_names": ["nginx"],
+      "host": "127.0.0.1",
+      "port": 80
+    },
+    {
+      "name": "docker",
+      "process_names": ["dockerd", "docker"],
+      "unix_socket": "/var/run/docker.sock"
+    }
+  ],
+  "log_jobs": [
+    {
+      "name": "nginx_error",
+      "path": "/var/log/nginx/error.log",
+      "patterns": [
+        ["upstream\\s+.*?(?:connect\\(\\) failed|timed out|prematurely closed|500|502|503|504)",
+         "NGINX_UPSTREAM_FAIL",
+         "Nginx 后端网关异常（连接失败/超时/5xx）"],
+        ["(?:connect\\(\\) failed|timed out).*?upstream",
+         "NGINX_UPSTREAM_FAIL",
+         "Nginx 后端网关异常（连接失败/超时，错误在前）"],
+        ["worker_connections\\s+are\\s+not\\s+enough",
+         "NGINX_CONN_EXHAUST",
+         "Nginx worker_connections 耗尽"]
+      ]
+    },
+    {
+      "name": "docker_oom",
+      "command": "docker ps -a --no-trunc --format '{{.Names}} {{.Status}}'",
+      "patterns": [
+        ["OOMKilled|oom-kill|Killed due to memory limit",
+         "DOCKER_OOM_KILL",
+         "容器被内核 OOM Killer 杀死"]
+      ]
+    }
+  ]
+}
