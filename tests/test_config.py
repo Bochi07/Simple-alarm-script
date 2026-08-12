@@ -12,6 +12,12 @@ class TestThresholds:
         assert config.THRESHOLDS["load1"]["warning"] == 1.0
         assert config.THRESHOLDS["load1"]["critical"] == 2.0
 
+    def test_memory_warning_threshold_is_80(self):
+        """内存/CPU 到 80% 才进入告警（用户约定），critical 保持 92。"""
+        assert config.THRESHOLDS["memory_percent"]["warning"] == 80.0
+        assert config.THRESHOLDS["memory_percent"]["critical"] == 92.0
+        assert config.THRESHOLDS["cpu_percent"]["warning"] == 80.0
+
     def test_env_override_threshold(self, monkeypatch):
         monkeypatch.setenv("LOAD1_WARNING", "1.5")
         thresholds = config._load_thresholds()
@@ -69,3 +75,26 @@ class TestReload:
             config.reload_config()
             assert config.THRESHOLDS["load1"]["warning"] == old_warning
             assert config.SERVICES == old_services
+
+
+class TestAlertConsecutive:
+    def test_default_is_three(self):
+        assert config.ALERT_CONSECUTIVE == 3
+
+    def test_env_override(self, monkeypatch):
+        old = config.ALERT_CONSECUTIVE
+        try:
+            monkeypatch.setenv("ALERT_CONSECUTIVE", "5")
+            config.reload_config()
+            assert config.ALERT_CONSECUTIVE == 5
+        finally:
+            monkeypatch.setenv("ALERT_CONSECUTIVE", str(old))
+            config.reload_config()
+            assert config.ALERT_CONSECUTIVE == old
+
+    def test_validate_rejects_zero(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONSECUTIVE", 0)
+        assert any(
+            level == "fatal" and "ALERT_CONSECUTIVE" in msg
+            for level, msg in config.validate()
+        )

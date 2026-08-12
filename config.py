@@ -123,7 +123,7 @@ def _load_json_env(key: str) -> list | None:
 # ============ 全部可重载配置 ============
 def _reload() -> None:
     """（重新）读取环境变量与配置文件并更新模块级配置；导入与 SIGHUP 共用。"""
-    global COLLECT_INTERVAL, LOG_SCAN_INTERVAL, ALERT_COOLDOWN, COLLECT_WORKERS
+    global COLLECT_INTERVAL, LOG_SCAN_INTERVAL, ALERT_COOLDOWN, ALERT_CONSECUTIVE, COLLECT_WORKERS
     global DINGTALK_WEBHOOK, DINGTALK_SECRET, WECOM_WEBHOOK, FEISHU_WEBHOOK
     global MONITOR_NOTIFY_STDOUT, PUSH_TIMEOUT, PUSH_MAX_RETRIES, PUSH_RETRY_BACKOFF
     global _STATE_DIR, ALERT_HISTORY_FILE, ALERT_HISTORY_MAX_BYTES, ALERT_HISTORY_BACKUPS
@@ -137,9 +137,10 @@ def _reload() -> None:
     _CONFIG_LOAD_ERRORS.clear()
 
     # ============ 采集与调度 ============
-    COLLECT_INTERVAL = _env_int("MONITOR_INTERVAL", 60)               # 指标采集周期（秒）
+    COLLECT_INTERVAL = _env_int("MONITOR_INTERVAL", 10)               # 指标采集周期（秒）
     LOG_SCAN_INTERVAL = _env_int("LOG_SCAN_INTERVAL", 10)             # 日志轮询周期（秒）
     ALERT_COOLDOWN = _env_int("ALERT_COOLDOWN", 300)                  # 同类型告警冷却（秒）
+    ALERT_CONSECUTIVE = _env_int("ALERT_CONSECUTIVE", 3)              # 连续异常 N 次才告警（恢复同理）
     COLLECT_WORKERS = _env_int("MONITOR_COLLECT_WORKERS", 4)          # 采集线程池 worker 数
 
     # ============ 通知渠道（环境变量注入，优先级：钉钉 > 企业微信 > 飞书） ============
@@ -276,6 +277,8 @@ def validate() -> list[tuple[str, str]]:
         problems.append(("fatal", "DISK_PATHS 每一项必须是绝对路径（以 / 开头）"))
     if ALERT_COOLDOWN < 0:
         problems.append(("fatal", "ALERT_COOLDOWN 不能为负数"))
+    if ALERT_CONSECUTIVE <= 0:
+        problems.append(("fatal", "ALERT_CONSECUTIVE 必须为正整数（连续异常次数）"))
     if PUSH_MAX_RETRIES < 0 or PUSH_TIMEOUT <= 0 or PUSH_RETRY_BACKOFF <= 0:
         problems.append(("fatal", "PUSH_MAX_RETRIES / PUSH_TIMEOUT / PUSH_RETRY_BACKOFF 配置不合法"))
 

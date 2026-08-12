@@ -171,9 +171,10 @@ DINGTALK_SECRET=
 # 非标准安装位置可用 paths 数组按序探测，如 paths:["/var/log/nginx/error.log","/www/server/nginx/logs/error.log"]
 
 # 采集与告警参数（可选，默认值见 README.md）
-# MONITOR_INTERVAL=60
+# MONITOR_INTERVAL=10
 # LOG_SCAN_INTERVAL=10
 # ALERT_COOLDOWN=300
+# ALERT_CONSECUTIVE=3
 # 阈值覆盖示例（默认见 README.md）
 # CPU_PERCENT_WARNING=85
 # CPU_PERCENT_CRITICAL=97

@@ -73,6 +73,9 @@ class MetricSnapshot:
     service_errors: list = field(default_factory=list)
     disks: list = field(default_factory=list)          # [{path, percent, used_gb, total_gb}]
     temperature_source: str = ""                       # 温度传感器来源（coretemp 等）
+    swap_percent: float = 0.0
+    swap_used_gb: float = 0.0
+    swap_total_gb: float = 0.0
 
 
 def utc_now_iso() -> str:
@@ -128,31 +131,61 @@ def get_cpu_percent_from_proc() -> float:
     return round((1 - idle / total) * 100, 2)
 
 
-# ================= 内存 =================
-def get_memory_metrics() -> dict:
-    """psutil 通道：内存使用率与绝对量。"""
-    mem = psutil.virtual_memory()
-    return {
-        "percent": mem.percent,
-        "used_gb": round(mem.used / 1024 ** 3, 2),
-        "total_gb": round(mem.total / 1024 ** 3, 2),
-    }
-
-
+# ================= 内存（含 swap） =================
 def get_memory_metrics_from_proc() -> dict:
-    """/proc 通道：解析 /proc/meminfo（单位 kB），交叉验证内存水位。"""
+    """/proc 通道：解析 /proc/meminfo（单位 kB），得到 RAM 与 swap 使用情况。
+
+    - RAM 使用率优先用 MemAvailable（与 free 的 available 口径一致）；
+      老内核没有 MemAvailable 时回退 MemFree+Buffers+Cached 近似；
+    - swap 完全缺失（如某些容器）时按 0 处理，不影响整体运行；
+    - /proc/meminfo 几乎存在于所有 Linux 系统，是“任意机器都能跑”的底座。
+    """
     data = {}
     with PROC_MEMINFO.open() as fp:
         for line in fp:
             key, _, rest = line.partition(":")
             data[key.strip()] = int(rest.strip().split()[0])
-    total = data["MemTotal"]
-    available = data["MemAvailable"]
-    used = total - available
+
+    total = data.get("MemTotal", 0)
+    if "MemAvailable" in data:
+        available = data["MemAvailable"]
+    else:
+        # 老内核（早于 MemAvailable 引入）按 free + buffers + cached 近似可用内存
+        available = data.get("MemFree", 0) + data.get("Buffers", 0) + data.get("Cached", 0)
+    used = max(total - available, 0)
+
+    swap_total = data.get("SwapTotal", 0)
+    swap_free = data.get("SwapFree", 0)
+    swap_used = max(swap_total - swap_free, 0)
     return {
-        "percent": round(used / total * 100, 2),
+        "percent": round(used / total * 100, 2) if total > 0 else 0.0,
         "used_gb": round(used / 1024 ** 2, 2),
         "total_gb": round(total / 1024 ** 2, 2),
+        "swap_percent": round(swap_used / swap_total * 100, 2) if swap_total > 0 else 0.0,
+        "swap_used_gb": round(swap_used / 1024 ** 2, 2),
+        "swap_total_gb": round(swap_total / 1024 ** 2, 2),
+    }
+
+
+def get_memory_metrics() -> dict:
+    """内存 + swap 指标：Linux 优先解析 /proc/meminfo，读取失败/非 Linux 回退 psutil。"""
+    try:
+        return get_memory_metrics_from_proc()
+    except Exception as exc:
+        logger.warning("内存 /proc 通道不可用，回退 psutil: %s", exc)
+
+    mem = psutil.virtual_memory()
+    try:
+        swap = psutil.swap_memory()
+    except Exception:
+        swap = None
+    return {
+        "percent": round(mem.percent, 2),
+        "used_gb": round(mem.used / 1024 ** 3, 2),
+        "total_gb": round(mem.total / 1024 ** 3, 2),
+        "swap_percent": round(swap.percent, 2) if swap else 0.0,
+        "swap_used_gb": round(swap.used / 1024 ** 3, 2) if swap else 0.0,
+        "swap_total_gb": round(swap.total / 1024 ** 3, 2) if swap else 0.0,
     }
 
 
@@ -383,6 +416,9 @@ def _collect_sync() -> MetricSnapshot:
         memory_percent=mem["percent"],
         memory_used_gb=mem["used_gb"],
         memory_total_gb=mem["total_gb"],
+        swap_percent=mem["swap_percent"],
+        swap_used_gb=mem["swap_used_gb"],
+        swap_total_gb=mem["swap_total_gb"],
         load1=load1,
         load5=load5,
         load15=load15,

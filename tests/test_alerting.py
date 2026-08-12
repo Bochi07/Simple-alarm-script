@@ -21,6 +21,9 @@ def make_snapshot(**overrides) -> MetricSnapshot:
         "memory_percent": 30.0,
         "memory_used_gb": 1.0,
         "memory_total_gb": 4.0,
+        "swap_percent": 0.0,
+        "swap_used_gb": 0.0,
+        "swap_total_gb": 0.0,
         "load1": 0.5,
         "load5": 0.4,
         "load15": 0.3,
@@ -112,6 +115,9 @@ class TestAlertEngine:
     def test_metric_alert_escalate_recover(self):
         engine = AlertEngine()
 
+        # 连续 3 次异常才告警，前两次只累计不推送
+        assert engine.evaluate(make_snapshot(cpu_percent=90.0)) == []
+        assert engine.evaluate(make_snapshot(cpu_percent=91.0)) == []
         alerts = engine.evaluate(make_snapshot(cpu_percent=90.0))
         assert [a["metric"] for a in alerts] == ["cpu_percent"]
         assert alerts[0]["level"] == "Warning"
@@ -124,7 +130,9 @@ class TestAlertEngine:
         alerts = engine.evaluate(make_snapshot(cpu_percent=97.0))
         assert alerts and alerts[0]["level"] == "Critical"
 
-        # 回落 -> 恢复通知（推送确认前状态不落盘）
+        # 回落 -> 连续 3 次正常才发恢复通知（推送确认前状态不落盘）
+        assert engine.evaluate(make_snapshot(cpu_percent=50.0)) == []
+        assert engine.evaluate(make_snapshot(cpu_percent=50.0)) == []
         alerts = engine.evaluate(make_snapshot(cpu_percent=50.0))
         assert alerts and alerts[0]["level"] == "Recovery"
         assert engine._last_levels.get("cpu_percent") == "Critical"
@@ -138,14 +146,18 @@ class TestAlertEngine:
             {"path": "/", "percent": 50.0, "used_gb": 10.0, "total_gb": 20.0},
             {"path": "/data", "percent": 88.0, "used_gb": 79.2, "total_gb": 90.0},
         ]
+        engine.evaluate(make_snapshot(disks=disks))
+        engine.evaluate(make_snapshot(disks=disks))
         alerts = engine.evaluate(make_snapshot(disks=disks))
         by_metric = {a["metric"]: a for a in alerts}
         assert "disk:/data" in by_metric
         assert by_metric["disk:/data"]["level"] == "Warning"
         assert "挂载点 /data" in by_metric["disk:/data"]["value"]
 
-        # 回落 -> 恢复，确认后不再重复
+        # 回落 -> 连续 3 次正常才恢复，确认后不再重复
         disks[1]["percent"] = 60.0
+        assert engine.evaluate(make_snapshot(disks=disks)) == []
+        assert engine.evaluate(make_snapshot(disks=disks)) == []
         alerts = engine.evaluate(make_snapshot(disks=disks))
         rec = [a for a in alerts if a["metric"] == "disk:/data"]
         assert rec and rec[0]["level"] == "Recovery"
@@ -156,12 +168,55 @@ class TestAlertEngine:
         engine = AlertEngine()
         with mock.patch("os.cpu_count", return_value=8):
             # 8 核机器 load1=9 -> 每核 1.125 -> Warning（阈值 1.0/核）
+            engine.evaluate(make_snapshot(load1=9.0))
+            engine.evaluate(make_snapshot(load1=9.0))
             alerts = engine.evaluate(make_snapshot(load1=9.0))
         load = [a for a in alerts if a["metric"] == "load1"]
         assert load and load[0]["level"] == "Warning"
         # value 与 threshold 尺度一致：value 标注归一化值 + 原始值，threshold 为每核阈值
         assert load[0]["value"] == "1.12x核（原始负载 9.00）"
         assert load[0]["threshold"] == "Warning:1.0x核 / Critical:2.0x核"
+
+    def test_memory_swap_counts_toward_alert(self):
+        """RAM 不高但 swap 已打满时必须告警，且消息同时展示 RAM 与 swap。"""
+        engine = AlertEngine()
+        snap = make_snapshot(memory_percent=30.0, swap_percent=100.0)
+        assert engine.evaluate(snap) == []
+        assert engine.evaluate(snap) == []
+        alerts = engine.evaluate(snap)
+        mem = [a for a in alerts if a["metric"] == "memory_percent"]
+        assert mem and mem[0]["level"] == "Critical"
+        assert "swap 100.0%" in mem[0]["value"]
+        assert "内存 30.0%" in mem[0]["value"]
+
+        # swap 回落后，连续 3 次正常才恢复
+        snap2 = make_snapshot(memory_percent=30.0, swap_percent=1.0)
+        assert engine.evaluate(snap2) == []
+        assert engine.evaluate(snap2) == []
+        rec = [a for a in engine.evaluate(snap2) if a["metric"] == "memory_percent"]
+        assert rec and rec[0]["level"] == "Recovery"
+
+    def test_consecutive_counter_resets_before_threshold(self):
+        """2 次异常后回落：计数清零，不告警；再次连续 3 次异常才告警。"""
+        engine = AlertEngine()
+        assert engine.evaluate(make_snapshot(cpu_percent=90.0)) == []
+        assert engine.evaluate(make_snapshot(cpu_percent=90.0)) == []
+        # 一次正常样本即清零连续异常计数
+        assert engine.evaluate(make_snapshot(cpu_percent=50.0)) == []
+        assert engine._consec.get("cpu_percent", 0) == 0
+
+        assert engine.evaluate(make_snapshot(cpu_percent=90.0)) == []
+        assert engine.evaluate(make_snapshot(cpu_percent=90.0)) == []
+        alerts = engine.evaluate(make_snapshot(cpu_percent=90.0))
+        assert [a["metric"] for a in alerts] == ["cpu_percent"]
+
+    def test_alert_consecutive_configurable(self, monkeypatch):
+        """ALERT_CONSECUTIVE=2 时，2 次异常即告警。"""
+        monkeypatch.setattr("alerting.ALERT_CONSECUTIVE", 2)
+        engine = AlertEngine()
+        assert engine.evaluate(make_snapshot(cpu_percent=90.0)) == []
+        alerts = engine.evaluate(make_snapshot(cpu_percent=90.0))
+        assert [a["metric"] for a in alerts] == ["cpu_percent"]
 
 
 class TestDingTalkSign:

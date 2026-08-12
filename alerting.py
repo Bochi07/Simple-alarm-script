@@ -3,6 +3,9 @@
 
 特性：
   - Warning / Critical 分级：命中阈值自动升级；
+  - 连续判定防抖：指标/磁盘连续 N 次（默认 3，ALERT_CONSECUTIVE）异常才告警，
+    连续 N 次正常才发恢复通知，避免单次毛刺误报；
+  - 内存含 swap：RAM 与 swap 使用率共同判定，任一超阈值即告警；
   - 冷却去抖：同指标同级别在冷却期内只推送一次，避免告警风暴；冷却状态持久化，
     进程重启后继续生效，不因重启立刻重复告警；
   - 恢复通知：指标回落、服务 DOWN->UP/SKIP、日志事件停止出现时，发送“已恢复”通知；
@@ -30,6 +33,7 @@ import config
 from collectors import MetricSnapshot, await_executor_future, utc_now_iso
 from config import (
     ALERT_COOLDOWN,
+    ALERT_CONSECUTIVE,
     ALERT_HISTORY_BACKUPS,
     ALERT_HISTORY_FILE,
     ALERT_HISTORY_MAX_BYTES,
@@ -68,6 +72,18 @@ _DISPLAY_NAME = {
     "service:skip:first-run": "服务自动跳过通知",
 }
 
+# 告警级别严重度排序（用于 RAM/swap 取较高级别）
+_SEVERITY_RANK = {"Warning": 1, "Critical": 2}
+
+
+def _pick_level(a: str | None, b: str | None) -> str | None:
+    """取两个告警级别中较严重的一个；None 表示未超阈值。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if _SEVERITY_RANK[a] >= _SEVERITY_RANK[b] else b
+
 
 def _display_metric(metric: str) -> str:
     """把内部指标名转成消息里更易读的名称。"""
@@ -84,8 +100,9 @@ def _display_metric(metric: str) -> str:
 _OPS_ADVICE = {
     "cpu_percent": "排查高占用进程：ps -eo pid,user,%cpu,comm --sort=-%cpu | head -20；"
                    "如为业务异常请重启相关服务。",
-    "memory_percent": "检查内存占用：free -h；定位大内存进程：top -o %MEM；"
-                      "如为缓存膨胀可等待内核自动回收；持续紧张请优化业务内存使用或扩容。",
+    "memory_percent": "检查内存与 swap 占用：free -h；定位大内存进程：top -o %MEM；"
+                      "swap 已大量占用说明内存持续吃紧，建议排查进程并优化内存使用或扩容；"
+                      "如为缓存膨胀可等待内核自动回收。",
     "disk_percent": "清理日志：find /var/log -type f -name '*.log' -size +100M -delete；"
                     "定位大目录：du -sh /var/log/* | sort -rh | head -20。",
     "temperature_c": "检查散热与负载：sensors；降低负载或检查风扇，防止硬件降频损坏。",
@@ -447,7 +464,8 @@ def _build_startup_report(snapshot: MetricSnapshot) -> tuple[str, str]:
 
     body_lines = ["**系统指标**", ""]
     body_lines.append(
-        f"- CPU：{snapshot.cpu_percent:.1f}% ｜ 内存：{snapshot.memory_percent:.1f}% ｜ "
+        f"- CPU：{snapshot.cpu_percent:.1f}% ｜ 内存：{snapshot.memory_percent:.1f}%"
+        f"（swap {snapshot.swap_percent:.1f}%）｜ "
         f"磁盘：{disk_part}"
     )
     body_lines.append(f"- 负载：{snapshot.load1:.2f} ｜ 温度：{temp_part}")
@@ -471,7 +489,8 @@ def _build_startup_report(snapshot: MetricSnapshot) -> tuple[str, str]:
     ]
 
     value = (
-        f"CPU {snapshot.cpu_percent:.1f}% / 内存 {snapshot.memory_percent:.1f}% / "
+        f"CPU {snapshot.cpu_percent:.1f}% / 内存 {snapshot.memory_percent:.1f}%"
+        f"（swap {snapshot.swap_percent:.1f}%）/ "
         f"磁盘 {disk_part} / 负载 {snapshot.load1:.2f} / 温度 {temp_part}"
     )
     return value, "\n".join(body_lines)
@@ -614,36 +633,98 @@ class AlertEngine:
         self._cooldown = Cooldown(ALERT_COOLDOWN, store=store)
         self._last_levels: dict[str, str] = {}
         self._last_services: dict[str, str] = {}
+        self._consec: dict[str, int] = {}          # 连续异常样本数（达 N 次才告警）
+        self._normal_consec: dict[str, int] = {}   # 连续正常样本数（达 N 次才发恢复）
         if store is not None:
             for key, val in store.data.items():
                 if key.startswith("metric:") and isinstance(val, str):
                     self._last_levels[key[len("metric:"):]] = val
                 elif key.startswith("service:") and isinstance(val, str):
                     self._last_services[key[len("service:"):]] = val
+                elif key.startswith("consec:") and isinstance(val, int):
+                    self._consec[key[len("consec:"):]] = val
+                elif key.startswith("normal:") and isinstance(val, int):
+                    self._normal_consec[key[len("normal:"):]] = val
+
+    # ---- 连续次数判定（指标/磁盘共用） ----
+    def _bump_consecutive(self, metric: str) -> bool:
+        """异常样本计数 +1；达到 ALERT_CONSECUTIVE 次返回 True（进入告警判定）。"""
+        threshold = max(int(ALERT_CONSECUTIVE or 1), 1)
+        n = self._consec.get(metric, 0)
+        if n >= threshold:
+            return True
+        n += 1
+        self._consec[metric] = n
+        if self._store is not None:
+            self._store.set(f"consec:{metric}", n)
+        return n >= threshold
+
+    def _reset_consecutive(self, metric: str) -> None:
+        if self._consec.pop(metric, None) is not None and self._store is not None:
+            self._store.delete(f"consec:{metric}")
+
+    def _bump_normal(self, metric: str) -> bool:
+        """恢复正常样本计数 +1；达到 ALERT_CONSECUTIVE 次返回 True（发送恢复通知）。"""
+        threshold = max(int(ALERT_CONSECUTIVE or 1), 1)
+        n = self._normal_consec.get(metric, 0)
+        if n >= threshold:
+            return True
+        n += 1
+        self._normal_consec[metric] = n
+        if self._store is not None:
+            self._store.set(f"normal:{metric}", n)
+        return n >= threshold
+
+    def _reset_normal(self, metric: str) -> None:
+        if self._normal_consec.pop(metric, None) is not None and self._store is not None:
+            self._store.delete(f"normal:{metric}")
+
+    def _try_alert(self, metric: str, level: str, prev: str | None, alert: dict) -> dict | None:
+        """连续 N 次异常后才执行告警/级别迁移；返回需推送的告警或 None。"""
+        if not self._bump_consecutive(metric):
+            return None
+        self._reset_normal(metric)
+        if level != prev:
+            self._last_levels[metric] = level
+            if self._store is not None:
+                self._store.set(f"metric:{metric}", level)
+        if self._pass_cooldown(alert):
+            return alert
+        return None
+
+    def _try_recovery(self, metric: str, alert: dict) -> dict | None:
+        """连续 N 次正常后才生成恢复通知（推送确认前状态不落盘）。"""
+        if not self._bump_normal(metric):
+            return None
+        if self._pass_cooldown(alert):
+            return alert
+        return None
 
     def evaluate(self, snapshot: MetricSnapshot) -> list:
         """对快照执行阈值与服务存活性判定，返回需推送的告警/恢复列表。"""
         alerts = []
         for metric, field in _METRIC_FIELD.items():
             value = float(getattr(snapshot, field))
-            level = _level_for(metric, value)
             rule = config.THRESHOLDS[metric]
-            prev = self._last_levels.get(metric)
+            level = _level_for(metric, value)
             if metric == "load1":
                 cores = max(os.cpu_count() or 1, 1)
                 norm = value / cores
                 value_text = f"{norm:.2f}x核（原始负载 {value:.2f}）"
                 threshold_text = f"Warning:{rule['warning']}x核 / Critical:{rule['critical']}x核"
+            elif metric == "memory_percent":
+                # 有 swap 的机器：RAM 与 swap 使用率共同判定，任一超阈值即告警，
+                # 避免“RAM 不高但 swap 已打满”的内存压力漏报。
+                level = _pick_level(level, _level_for("memory_percent", snapshot.swap_percent))
+                value_text = f"内存 {snapshot.memory_percent:.1f}% ｜ swap {snapshot.swap_percent:.1f}%"
+                threshold_text = f"Warning:{rule['warning']}{rule['unit']} / Critical:{rule['critical']}{rule['unit']}"
             else:
                 value_text = f"{value:.1f}{rule['unit']}"
                 threshold_text = f"Warning:{rule['warning']}{rule['unit']} / Critical:{rule['critical']}{rule['unit']}"
+            prev = self._last_levels.get(metric)
             if level:
-                # 告警（含 Warning->Critical 升级与 Critical->Warning 降级）立即落盘；
-                # 持续同级别告警不重复写盘（冷却期内也不会重复推送）。
-                if level != prev:
-                    self._last_levels[metric] = level
-                    if self._store is not None:
-                        self._store.set(f"metric:{metric}", level)
+                # 连续 N 次异常才真正告警（含 Warning->Critical 升级与降级）；
+                # 未达次数前不更新级别、不占冷却，避免单次抖动误报。
                 alert = {
                     "metric": metric,
                     "hostname": snapshot.hostname,
@@ -654,11 +735,12 @@ class AlertEngine:
                     "unit": rule["unit"],
                     "advice": _OPS_ADVICE[metric],
                 }
-                if self._pass_cooldown(alert):
-                    alerts.append(alert)
+                out = self._try_alert(metric, level, prev, alert)
+                if out:
+                    alerts.append(out)
             elif prev in ("Warning", "Critical"):
-                # 指标已回落至正常范围：先发送恢复通知，状态迁移等推送确认后再落盘，
-                # 避免“推送失败 -> 状态已记为 ok -> 恢复通知永久丢失”。
+                # 指标已回落：连续 N 次正常才发恢复通知，状态迁移等推送确认后再落盘，
+                # 避免“推送失败 -> 状态已记为 ok -> 恢复通知永久丢失”，也避免抖动误恢复。
                 alert = {
                     "metric": metric,
                     "hostname": snapshot.hostname,
@@ -670,10 +752,13 @@ class AlertEngine:
                     "advice": "指标已回落至阈值以下，恢复正常。请确认关联业务影响已消除。",
                     "diagnosis": "指标从告警状态回落至正常水位。",
                 }
-                if self._pass_cooldown(alert):
-                    alerts.append(alert)
+                out = self._try_recovery(metric, alert)
+                if out:
+                    alerts.append(out)
             elif prev is None:
                 # 首次观测（进程重启后无历史状态）：直接记为正常，避免误发恢复通知
+                self._reset_consecutive(metric)
+                self._reset_normal(metric)
                 self._last_levels[metric] = "ok"
                 if self._store is not None:
                     self._store.set(f"metric:{metric}", "ok")
@@ -687,10 +772,6 @@ class AlertEngine:
             rule = config.THRESHOLDS["disk_percent"]
             prev = self._last_levels.get(metric)
             if level:
-                if level != prev:
-                    self._last_levels[metric] = level
-                    if self._store is not None:
-                        self._store.set(f"metric:{metric}", level)
                 alert = {
                     "metric": metric,
                     "hostname": snapshot.hostname,
@@ -701,8 +782,9 @@ class AlertEngine:
                     "unit": "%",
                     "advice": _OPS_ADVICE["disk_percent"],
                 }
-                if self._pass_cooldown(alert):
-                    alerts.append(alert)
+                out = self._try_alert(metric, level, prev, alert)
+                if out:
+                    alerts.append(out)
             elif prev in ("Warning", "Critical"):
                 alert = {
                     "metric": metric,
@@ -715,9 +797,12 @@ class AlertEngine:
                     "advice": "磁盘占用已回落至阈值以下，恢复正常。请确认清理效果。",
                     "diagnosis": f"挂载点 {path} 磁盘占用从告警状态回落至正常水位。",
                 }
-                if self._pass_cooldown(alert):
-                    alerts.append(alert)
+                out = self._try_recovery(metric, alert)
+                if out:
+                    alerts.append(out)
             elif prev is None:
+                self._reset_consecutive(metric)
+                self._reset_normal(metric)
                 self._last_levels[metric] = "ok"
                 if self._store is not None:
                     self._store.set(f"metric:{metric}", "ok")
@@ -791,6 +876,8 @@ class AlertEngine:
             self._last_levels[metric] = "ok"
             if self._store is not None:
                 self._store.set(f"metric:{metric}", "ok")
+        # 恢复通知送达后清零“连续正常”计数，避免后续正常样本重复计次
+        self._reset_normal(metric)
 
     def forget(self, alert: dict) -> None:
         """推送失败后清冷却，允许下一轮重试。"""

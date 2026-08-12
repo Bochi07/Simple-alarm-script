@@ -23,7 +23,7 @@
 
 | 场景 | 能力 |
 |---|---|
-| 系统资源异常 | 采集 CPU / 内存 / 磁盘 / 负载 / 温度，超阈值分级告警 |
+| 系统资源异常 | 采集 CPU / 内存（含 swap）/ 磁盘 / 负载 / 温度，连续 N 次超阈值分级告警 |
 | 服务挂了没人知道 | 按进程、端口、Unix socket 探测服务存活，DOWN 立即告警，未安装自动跳过 |
 | 关键日志刷屏 | 增量轮询 Nginx / Docker 等日志，命中错误模式聚合推送，联动系统指标给出根因诊断 |
 
@@ -31,6 +31,9 @@
 
 - **指标监控**：CPU（psutil + `/proc` 双通道）、内存、磁盘、负载、温度；
 - **分级阈值**：每个指标独立配置 Warning / Critical 两级，可经环境变量按主机覆盖；
+- **内存含 swap**：内存告警同时看 RAM 与 swap 使用率，swap 打满不会漏报；
+- **连续判定防抖**：指标/磁盘连续 N 次（默认 3 次）异常才告警，连续 N 次正常才发恢复，
+  偶发毛刺不再单次误报；
 - **负载告警**：load1 按 CPU 核数归一化（load1 / 核数）后分级告警，2 核与 8 核机器不会误报/漏报；
 - **磁盘多挂载点**：`DISK_PATHS` 可配置多个挂载点，任一超阈值告警并带上挂载点；
 - **服务存活监控**：进程 / 二进制 / 监听端口 / Unix socket 四重探测；
@@ -100,6 +103,8 @@ monitor-agent/
   监控循环；失败按 `2s → 4s → 8s` 指数退避，仍失败则本轮放弃、下一轮重新触发；
 - **告警风暴抑制**：同指标同级别（`metric:level`）在冷却窗口内只推一次；
   日志按代码（`log:<code>`）聚合 + 冷却；
+- **连续 N 次判定**：指标/磁盘须连续 N 次（默认 3，`ALERT_CONSECUTIVE`）超阈值才告警，
+  恢复同样要求连续 N 次正常；配合 10s 采集周期，持续异常约 30s 内确认并推送；
 - **恢复通知可靠性**：指标/服务恢复时先生成恢复通知，**推送成功后才**把状态落盘为
   “已恢复”；推送失败保持告警状态，下一轮重新生成，不会丢失；
 - **SKIP 判定**：服务配置了，但本机既无进程、无二进制、无 socket、无监听端口，
@@ -301,9 +306,10 @@ tail -f ~/.local/state/monitor-agent/alerts.jsonl   # 看留痕（systemd 下在
 | `WECOM_WEBHOOK` | 空 | 企业微信机器人 Webhook（配置后优先于钉钉） |
 | `FEISHU_WEBHOOK` | 空 | 飞书机器人 Webhook（未配置钉钉/企业微信时生效） |
 | `MONITOR_NOTIFY_STDOUT` | 0 | 1 时告警仅打印到 stdout（配合 journald / 调试） |
-| `MONITOR_INTERVAL` | 60 | 指标采集周期（秒） |
+| `MONITOR_INTERVAL` | 10 | 指标采集周期（秒） |
 | `LOG_SCAN_INTERVAL` | 10 | 日志轮询周期（秒） |
 | `ALERT_COOLDOWN` | 300 | 同类型告警冷却（秒） |
+| `ALERT_CONSECUTIVE` | 3 | 指标/磁盘连续异常次数，达到 N 次才告警（恢复同理） |
 | `MONITOR_COLLECT_WORKERS` | 4 | 指标采集线程池 worker 数 |
 | `PUSH_TIMEOUT` | 5 | 单次 HTTP 推送超时（秒） |
 | `PUSH_MAX_RETRIES` | 3 | 推送失败重试次数（指数退避） |
@@ -311,7 +317,7 @@ tail -f ~/.local/state/monitor-agent/alerts.jsonl   # 看留痕（systemd 下在
 | `MONITOR_COMMAND_SHELL` | 空 | 命令型日志使用的 shell（默认自动探测 bash → sh） |
 | `LOG_COMMAND_TIMEOUT` | 15 | 命令型日志单次执行超时（秒） |
 | `CPU_PERCENT_WARNING` / `CPU_PERCENT_CRITICAL` | 80 / 95 | CPU 分级阈值覆盖 |
-| `MEMORY_PERCENT_WARNING` / `MEMORY_PERCENT_CRITICAL` | 80 / 92 | 内存分级阈值覆盖 |
+| `MEMORY_PERCENT_WARNING` / `MEMORY_PERCENT_CRITICAL` | 80 / 92 | 内存分级阈值覆盖（RAM 与 swap 任一超阈值即告警） |
 | `DISK_PERCENT_WARNING` / `DISK_PERCENT_CRITICAL` | 80 / 90 | 磁盘分级阈值覆盖 |
 | `TEMPERATURE_C_WARNING` / `TEMPERATURE_C_CRITICAL` | 70 / 85 | 温度分级阈值覆盖 |
 | `LOAD1_WARNING` / `LOAD1_CRITICAL` | 1.0 / 2.0（每核） | 负载分级阈值（load1/核数 归一化后比较） |

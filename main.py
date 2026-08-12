@@ -159,10 +159,12 @@ async def metrics_loop(state_store: StateStore) -> None:
             s = latest_snapshot
             logger.info(
                 "采集完成 cpu=%.1f%%(/proc %.1f%%) mem=%.1f%%(%.2f/%.2fGB) "
+                "swap=%.1f%%(%.2f/%.2fGB) "
                 "disk=%.1f%%(%.2f/%.2fGB) load=%.2f temp=%.1fC services=%s",
                 s.cpu_percent, s.cpu_percent_proc, s.memory_percent,
-                s.memory_used_gb, s.memory_total_gb, s.disk_percent,
-                s.disk_used_gb, s.disk_total_gb, s.load1,
+                s.memory_used_gb, s.memory_total_gb,
+                s.swap_percent, s.swap_used_gb, s.swap_total_gb,
+                s.disk_percent, s.disk_used_gb, s.disk_total_gb, s.load1,
                 s.temperature_c, s.services,
             )
             # 首次采集完成后发送一次“开机状态播报”：当前系统指标 + 服务 UP/DOWN/SKIP 明细。
