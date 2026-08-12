@@ -97,6 +97,14 @@ LOG_COMMAND_TIMEOUT = _env_float("LOG_COMMAND_TIMEOUT", 15.0)     # 单次日志
 # ============ 退出收尾 ============
 SHUTDOWN_TIMEOUT = _env_float("MONITOR_SHUTDOWN_TIMEOUT", 5.0)    # 线程池收尾上限（秒）
 
+# ============ 磁盘监控挂载点 ============
+# 逗号分隔的绝对路径列表（默认仅 /），任一挂载点超阈值即告警，消息会带上挂载点。
+def _load_disk_paths() -> list[str]:
+    return [p.strip() for p in os.getenv("DISK_PATHS", "/").split(",") if p.strip()]
+
+
+DISK_PATHS = _load_disk_paths()
+
 # ============ 分级阈值（Warning / Critical，可环境变量覆盖） ============
 # 覆盖方式：<指标名大写>_WARNING / <指标名大写>_CRITICAL，例如：
 #   CPU_PERCENT_WARNING=85   CPU_PERCENT_CRITICAL=97
@@ -106,6 +114,8 @@ _DEFAULT_THRESHOLDS = {
     "memory_percent": {"warning": 80.0, "critical": 92.0, "unit": "%"},
     "disk_percent": {"warning": 80.0, "critical": 90.0, "unit": "%"},
     "temperature_c": {"warning": 70.0, "critical": 85.0, "unit": "℃"},
+    # 负载阈值按“每核负载”定义：1.0 = 满核，2.0 = 平均每核排队 2 个任务
+    "load1": {"warning": 1.0, "critical": 2.0, "unit": "x核"},
 }
 
 
@@ -228,6 +238,10 @@ def validate() -> list[tuple[str, str]]:
         problems.append(("fatal", "MONITOR_INTERVAL / LOG_SCAN_INTERVAL 必须为正整数"))
     if COLLECT_WORKERS <= 0:
         problems.append(("fatal", "MONITOR_COLLECT_WORKERS 必须为正整数"))
+    if not DISK_PATHS:
+        problems.append(("fatal", "DISK_PATHS 不能为空（逗号分隔的绝对路径列表）"))
+    elif any(not p.startswith("/") for p in DISK_PATHS):
+        problems.append(("fatal", "DISK_PATHS 每一项必须是绝对路径（以 / 开头）"))
     if ALERT_COOLDOWN < 0:
         problems.append(("fatal", "ALERT_COOLDOWN 不能为负数"))
     if PUSH_MAX_RETRIES < 0 or PUSH_TIMEOUT <= 0 or PUSH_RETRY_BACKOFF <= 0:

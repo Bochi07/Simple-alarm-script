@@ -17,14 +17,14 @@ import logging
 import os
 import shutil
 import socket
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
 
-from config import COLLECT_WORKERS, SERVICES
+from config import COLLECT_WORKERS, DISK_PATHS, SERVICES
 
 logger = logging.getLogger("monitor.collect")
 
@@ -55,7 +55,7 @@ async def await_executor_future(fut):
 @dataclass
 class MetricSnapshot:
     hostname: str
-    timestamp: str                 # 本地时间字符串
+    timestamp: str                 # UTC/ISO8601 时间戳（展示层再转本地）
     cpu_percent: float
     cpu_percent_proc: float        # /proc/stat 计算值
     memory_percent: float
@@ -70,6 +70,12 @@ class MetricSnapshot:
     temperature_c: float           # -1.0 表示无温度传感器
     services: dict = field(default_factory=dict)      # {服务名: UP/DOWN}
     service_errors: list = field(default_factory=list)
+    disks: list = field(default_factory=list)          # [{path, percent, used_gb, total_gb}]
+
+
+def utc_now_iso() -> str:
+    """返回带时区的 UTC 时间戳（ISO8601，秒精度），留痕/告警统一使用。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # ================= CPU =================
@@ -170,6 +176,23 @@ def get_disk_usage(path: str = "/") -> dict:
         "used_gb": round(du.used / 1024 ** 3, 2),
         "total_gb": round(du.total / 1024 ** 3, 2),
     }
+
+
+def get_disk_usage_all() -> list:
+    """按 DISK_PATHS 采集各挂载点磁盘占用；单个路径不可用跳过，不影响其他挂载点。"""
+    disks = []
+    for path in DISK_PATHS:
+        try:
+            du = psutil.disk_usage(path)
+            disks.append({
+                "path": path,
+                "percent": du.percent,
+                "used_gb": round(du.used / 1024 ** 3, 2),
+                "total_gb": round(du.total / 1024 ** 3, 2),
+            })
+        except OSError as exc:
+            logger.warning("磁盘路径 %s 不可用，已跳过: %s", path, exc)
+    return disks
 
 
 # ================= 温度 =================
@@ -320,7 +343,8 @@ def check_service(svc: dict) -> tuple:
 def _collect_sync() -> MetricSnapshot:
     """同步采集一轮完整指标（在线程池中执行）。"""
     mem = get_memory_metrics()
-    disk = get_disk_usage()
+    disks = get_disk_usage_all()
+    disk = max(disks, key=lambda d: d["percent"]) if disks else {"percent": 0.0, "used_gb": 0.0, "total_gb": 0.0}
     load1, load5, load15 = get_loadavg()
 
     services, service_errors = {}, []
@@ -337,7 +361,7 @@ def _collect_sync() -> MetricSnapshot:
 
     return MetricSnapshot(
         hostname=socket.gethostname(),
-        timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+        timestamp=utc_now_iso(),
         cpu_percent=get_cpu_percent(),
         cpu_percent_proc=get_cpu_percent_from_proc(),
         memory_percent=mem["percent"],
@@ -352,6 +376,7 @@ def _collect_sync() -> MetricSnapshot:
         temperature_c=get_temperature(),
         services=services,
         service_errors=service_errors,
+        disks=disks,
     )
 
 

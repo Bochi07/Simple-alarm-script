@@ -18,13 +18,15 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
-from collectors import MetricSnapshot, await_executor_future
+from collectors import MetricSnapshot, await_executor_future, utc_now_iso
 from config import (
     ALERT_COOLDOWN,
     ALERT_HISTORY_BACKUPS,
@@ -50,8 +52,8 @@ PUSH_ABORT = threading.Event()
 _METRIC_FIELD = {
     "cpu_percent": "cpu_percent",
     "memory_percent": "memory_percent",
-    "disk_percent": "disk_percent",
     "temperature_c": "temperature_c",
+    "load1": "load1",
 }
 
 # 服务状态色点（钉钉消息中仅用这三个圆圈表示 UP / DOWN / SKIP）
@@ -71,6 +73,8 @@ _DISPLAY_NAME = {
 
 def _display_metric(metric: str) -> str:
     """把内部指标名转成消息里更易读的名称。"""
+    if metric.startswith("disk:"):
+        return f"磁盘（{metric[len('disk:'):]}）"
     if metric.startswith("log:"):
         return metric[len("log:"):]
     if metric.startswith("service:"):
@@ -87,6 +91,8 @@ _OPS_ADVICE = {
     "disk_percent": "清理日志：find /var/log -type f -name '*.log' -size +100M -delete；"
                     "定位大目录：du -sh /var/log/* | sort -rh | head -20。",
     "temperature_c": "检查散热与负载：sensors；降低负载或检查风扇，防止硬件降频损坏。",
+    "load1": "定位高负载来源：top / pidstat / ps -eo pid,user,%cpu,comm --sort=-%cpu；"
+             "检查是否 CPU 核数不足或存在死循环进程，必要时扩容。",
     "service_down": "拉起服务：systemctl restart {svc}；查看日志：journalctl -u {svc} -n 50 --no-pager。",
 }
 
@@ -145,11 +151,25 @@ def _level_for(metric: str, value: float) -> str | None:
     rule = THRESHOLDS.get(metric)
     if not rule:
         return None
+    if metric == "load1":
+        # 负载按 CPU 核数归一化：load1 / 核数，阈值按“每核负载”定义
+        value = value / max(os.cpu_count() or 1, 1)
     if value >= rule["critical"]:
         return "Critical"
     if value >= rule["warning"]:
         return "Warning"
     return None
+
+
+def _display_time(ts: str) -> str:
+    """把 UTC/ISO8601 时间戳转成本地时区展示；解析失败原样返回。"""
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return ts
 
 
 # ================= 冷却器 =================
@@ -232,15 +252,19 @@ class LogRecoveryTracker:
 
 
 # ================= 钉钉加签与推送 =================
-def _sign(url: str, secret: str) -> str:
-    """钉钉安全设置-加签：timestamp + secret -> HMAC-SHA256 -> base64 -> urlencode。"""
-    timestamp = str(round(time.time() * 1000))
+def _compute_sign(secret: str, timestamp: str) -> str:
+    """计算钉钉加签值：HMAC-SHA256 -> base64 -> urlencode（供测试与 _sign 复用）。"""
     string_to_sign = f"{timestamp}\n{secret}"
     hmac_code = hmac.new(
         secret.encode("utf-8"), string_to_sign.encode("utf-8"), digestmod=hashlib.sha256
     ).digest()
-    sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
-    return f"{url}&timestamp={timestamp}&sign={sign}"
+    return urllib.parse.quote_plus(base64.b64encode(hmac_code))
+
+
+def _sign(url: str, secret: str) -> str:
+    """钉钉安全设置-加签：timestamp + secret -> HMAC-SHA256 -> base64 -> urlencode。"""
+    timestamp = str(round(time.time() * 1000))
+    return f"{url}&timestamp={timestamp}&sign={_compute_sign(secret, timestamp)}"
 
 
 def _build_alert_payload(alert: dict) -> str:
@@ -257,7 +281,11 @@ def _build_alert_payload(alert: dict) -> str:
         title = f"[{alert['level']}] 告警 - {label}"
         heading = f"## 告警 - {label}（{alert['level']}）"
 
-    lines = [heading, "", f"**主机**：{alert['hostname']}", f"**时间**：{alert['timestamp']}"]
+    lines = [
+        heading, "",
+        f"**主机**：{alert['hostname']}",
+        f"**时间**：{_display_time(alert['timestamp'])}",
+    ]
     body = alert.get("body")
     if body:
         lines += ["", body]
@@ -324,7 +352,7 @@ def _mark_skip_notified(services: list[str]) -> None:
     try:
         SKIP_NOTIFY_FILE.parent.mkdir(parents=True, exist_ok=True)
         data = {
-            "notified_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "notified_at": utc_now_iso(),
             "services": sorted(set(services)),
         }
         tmp = SKIP_NOTIFY_FILE.with_name(SKIP_NOTIFY_FILE.name + ".tmp")
@@ -540,6 +568,12 @@ class AlertEngine:
             level = _level_for(metric, value)
             rule = THRESHOLDS[metric]
             prev = self._last_levels.get(metric)
+            if metric == "load1":
+                value_text = f"{value:.2f}"
+                threshold_text = f"Warning:{rule['warning']}x核 / Critical:{rule['critical']}x核"
+            else:
+                value_text = f"{value:.1f}{rule['unit']}"
+                threshold_text = f"Warning:{rule['warning']}{rule['unit']} / Critical:{rule['critical']}{rule['unit']}"
             if level:
                 # 告警（含 Warning->Critical 升级与 Critical->Warning 降级）立即落盘；
                 # 持续同级别告警不重复写盘（冷却期内也不会重复推送）。
@@ -551,8 +585,8 @@ class AlertEngine:
                     "metric": metric,
                     "hostname": snapshot.hostname,
                     "timestamp": snapshot.timestamp,
-                    "value": f"{value:.1f}{rule['unit']}",
-                    "threshold": f"Warning:{rule['warning']}{rule['unit']} / Critical:{rule['critical']}{rule['unit']}",
+                    "value": value_text,
+                    "threshold": threshold_text,
                     "level": level,
                     "unit": rule["unit"],
                     "advice": _OPS_ADVICE[metric],
@@ -566,8 +600,8 @@ class AlertEngine:
                     "metric": metric,
                     "hostname": snapshot.hostname,
                     "timestamp": snapshot.timestamp,
-                    "value": f"{value:.1f}{rule['unit']}（已回落至正常范围）",
-                    "threshold": f"Warning:{rule['warning']}{rule['unit']} / Critical:{rule['critical']}{rule['unit']}",
+                    "value": f"{value_text}（已回落至正常范围）",
+                    "threshold": threshold_text,
                     "level": "Recovery",
                     "unit": rule["unit"],
                     "advice": "指标已回落至阈值以下，恢复正常。请确认关联业务影响已消除。",
@@ -577,6 +611,50 @@ class AlertEngine:
                     alerts.append(alert)
             elif prev is None:
                 # 首次观测（进程重启后无历史状态）：直接记为正常，避免误发恢复通知
+                self._last_levels[metric] = "ok"
+                if self._store is not None:
+                    self._store.set(f"metric:{metric}", "ok")
+
+        # 磁盘多挂载点：每个挂载点独立判定（metric=disk:<path>），消息带挂载点
+        for disk in (snapshot.disks or []):
+            path = disk["path"]
+            pct = float(disk["percent"])
+            metric = f"disk:{path}"
+            level = _level_for("disk_percent", pct)
+            rule = THRESHOLDS["disk_percent"]
+            prev = self._last_levels.get(metric)
+            if level:
+                if level != prev:
+                    self._last_levels[metric] = level
+                    if self._store is not None:
+                        self._store.set(f"metric:{metric}", level)
+                alert = {
+                    "metric": metric,
+                    "hostname": snapshot.hostname,
+                    "timestamp": snapshot.timestamp,
+                    "value": f"{pct:.1f}%（挂载点 {path}）",
+                    "threshold": f"Warning:{rule['warning']}% / Critical:{rule['critical']}%",
+                    "level": level,
+                    "unit": "%",
+                    "advice": _OPS_ADVICE["disk_percent"],
+                }
+                if self._pass_cooldown(alert):
+                    alerts.append(alert)
+            elif prev in ("Warning", "Critical"):
+                alert = {
+                    "metric": metric,
+                    "hostname": snapshot.hostname,
+                    "timestamp": snapshot.timestamp,
+                    "value": f"{pct:.1f}%（挂载点 {path}，已回落至正常范围）",
+                    "threshold": f"Warning:{rule['warning']}% / Critical:{rule['critical']}%",
+                    "level": "Recovery",
+                    "unit": "%",
+                    "advice": "磁盘占用已回落至阈值以下，恢复正常。请确认清理效果。",
+                    "diagnosis": f"挂载点 {path} 磁盘占用从告警状态回落至正常水位。",
+                }
+                if self._pass_cooldown(alert):
+                    alerts.append(alert)
+            elif prev is None:
                 self._last_levels[metric] = "ok"
                 if self._store is not None:
                     self._store.set(f"metric:{metric}", "ok")
@@ -638,6 +716,10 @@ class AlertEngine:
             self._last_services[name] = status
             if self._store is not None:
                 self._store.set(f"service:{name}", status)
+        elif metric.startswith("disk:"):
+            self._last_levels[metric] = "ok"
+            if self._store is not None:
+                self._store.set(f"metric:{metric}", "ok")
         elif metric in _METRIC_FIELD:
             self._last_levels[metric] = "ok"
             if self._store is not None:

@@ -12,16 +12,17 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
 import shutil
 import socket
 import subprocess
-import time
 from pathlib import Path
 
-from collectors import MetricSnapshot, _find_binary
+from collectors import EXECUTOR as COLLECT_EXECUTOR
+from collectors import MetricSnapshot, _find_binary, await_executor_future, utc_now_iso
 from config import COMMAND_SHELL, DIAGNOSTICS, LOG_COMMAND_TIMEOUT, LOG_JOBS, THRESHOLDS
 
 logger = logging.getLogger("monitor.logwatch")
@@ -143,11 +144,18 @@ class FileLogWatcher:
 
 
 class CommandLogWatcher:
-    """命令型日志轮询器：定时执行命令并全文匹配（如 docker ps -a）。"""
+    """命令型日志轮询器：定时执行命令并全文匹配（如 docker ps -a）。
+
+    采用“状态快照 diff”：只对**本轮新出现**的命中行产生事件，已出现过的行
+    不再重复触发。这样 docker ps 等全量快照类命令，即使容器持续处于
+    OOMKilled 状态，也不会每轮（或每个冷却周期）重复推送告警。
+    """
 
     def __init__(self, command: str, patterns: list):
         self.command = command
         self.patterns = [(re.compile(p), code, desc) for p, code, desc in patterns]
+        self._last_matched: set[str] = set()
+        self._state_max = 500  # 有界保留最近命中行，防止长期运行内存无限增长
         first = command.split()[0] if command.split() else ""
         self._shell = _resolve_shell()
         self._missing = False
@@ -175,11 +183,21 @@ class CommandLogWatcher:
             return []
         events = []
         seen: set[str] = set()
+        matched: set[str] = set()
         for raw in out.splitlines():
             line = raw.strip()
             if not line or line in seen:
                 continue
             seen.add(line)
+            for rx, code, desc in self.patterns:
+                if rx.search(line):
+                    matched.add(line)
+                    break
+        new_lines = matched - self._last_matched
+        if len(self._last_matched) > self._state_max:
+            self._last_matched = set(sorted(self._last_matched)[-self._state_max:])
+        self._last_matched = self._last_matched | matched
+        for line in sorted(new_lines):
             for rx, code, desc in self.patterns:
                 if rx.search(line):
                     events.append(LogEvent(code, desc, self.command, line, hostname))
@@ -230,12 +248,22 @@ class LogSemanticEngine:
                                  job.get("name", "?"), exc)
         return watchers
 
-    def poll_once(self, snapshot: MetricSnapshot | None) -> list:
-        """轮询所有 watcher，返回带语义诊断的告警事件字典列表；单 watcher 异常不拖垮整轮。"""
+    async def poll_once_async(self, snapshot: MetricSnapshot | None) -> list:
+        """异步轮询所有 watcher，返回带语义诊断的告警事件字典列表。
+
+        命令型 watcher（subprocess）提交到采集线程池执行，避免 docker ps 等
+        阻塞命令卡住事件循环；单 watcher 异常不拖垮整轮。
+        """
         alerts = []
+        loop = asyncio.get_running_loop()
         for watcher in self.watchers:
             try:
-                for ev in watcher.poll(self.hostname):
+                if isinstance(watcher, CommandLogWatcher):
+                    fut = loop.run_in_executor(COLLECT_EXECUTOR, watcher.poll, self.hostname)
+                    events = await await_executor_future(fut)
+                else:
+                    events = watcher.poll(self.hostname)
+                for ev in events:
                     alerts.append(self._decorate(ev, snapshot))
             except Exception as exc:
                 logger.exception("日志 watcher 轮询异常: %s", exc)
@@ -243,7 +271,7 @@ class LogSemanticEngine:
 
     def _decorate(self, ev: LogEvent, snapshot: MetricSnapshot | None) -> dict:
         base = ev.to_dict()
-        base["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        base["timestamp"] = utc_now_iso()
         diag = None
         if snapshot is not None:
             for rule in DIAGNOSTICS:
@@ -269,8 +297,12 @@ class LogSemanticEngine:
 if __name__ == "__main__":
     # 独立自检：单轮轮询演示
     logging.basicConfig(level=logging.INFO)
-    engine = LogSemanticEngine(socket.gethostname())
-    events = engine.poll_once(None)
-    print("本轮命中事件数:", len(events))
-    for e in events:
-        print(e)
+
+    async def _demo() -> None:
+        engine = LogSemanticEngine(socket.gethostname())
+        events = await engine.poll_once_async(None)
+        print("本轮命中事件数:", len(events))
+        for e in events:
+            print(e)
+
+    asyncio.run(_demo())

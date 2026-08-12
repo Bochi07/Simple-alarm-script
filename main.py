@@ -47,7 +47,7 @@ from alerting import (
     push_alert_async,
 )
 from collectors import EXECUTOR as COLLECT_EXECUTOR
-from collectors import collect_snapshot, prime_cpu_baseline
+from collectors import collect_snapshot, prime_cpu_baseline, utc_now_iso
 from config import (
     ALERT_COOLDOWN,
     ALERT_HISTORY_FILE,
@@ -212,7 +212,7 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 break
             continue
         try:
-            events = engine.poll_once(latest_snapshot)
+            events = await engine.poll_once_async(latest_snapshot)
             grouped: dict[str, list] = {}
             for ev in events:
                 grouped.setdefault(ev["code"], []).append(ev)
@@ -232,7 +232,7 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 alert = {
                     "metric": f"log:{code}",
                     "hostname": group[0]["hostname"],
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": utc_now_iso(),
                     "value": f"命中 {len(group)} 条",
                     "body": body,
                     "threshold": "-",
@@ -257,7 +257,7 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 alert = {
                     "metric": f"log:{code}",
                     "hostname": socket.gethostname(),
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": utc_now_iso(),
                     "value": f"冷却窗口 {ALERT_COOLDOWN}s 内无新命中",
                     "threshold": "-",
                     "level": "Recovery",
