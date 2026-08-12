@@ -391,11 +391,13 @@ class AlertEngine:
             level = _level_for(metric, value)
             rule = THRESHOLDS[metric]
             prev = self._last_levels.get(metric)
-            if level != prev:
-                self._last_levels[metric] = level if level else "ok"
-                if self._store is not None:
-                    self._store.set(f"metric:{metric}", self._last_levels[metric])
             if level:
+                # 告警（含 Warning->Critical 升级与 Critical->Warning 降级）立即落盘；
+                # 持续同级别告警不重复写盘（冷却期内也不会重复推送）。
+                if level != prev:
+                    self._last_levels[metric] = level
+                    if self._store is not None:
+                        self._store.set(f"metric:{metric}", level)
                 alert = {
                     "metric": metric,
                     "hostname": snapshot.hostname,
@@ -409,7 +411,8 @@ class AlertEngine:
                 if self._pass_cooldown(alert):
                     alerts.append(alert)
             elif prev in ("Warning", "Critical"):
-                # 指标已回落至正常范围：发送一次恢复通知
+                # 指标已回落至正常范围：先发送恢复通知，状态迁移等推送确认后再落盘，
+                # 避免“推送失败 -> 状态已记为 ok -> 恢复通知永久丢失”。
                 alert = {
                     "metric": metric,
                     "hostname": snapshot.hostname,
@@ -423,6 +426,11 @@ class AlertEngine:
                 }
                 if self._pass_cooldown(alert):
                     alerts.append(alert)
+            elif prev is None:
+                # 首次观测（进程重启后无历史状态）：直接记为正常，避免误发恢复通知
+                self._last_levels[metric] = "ok"
+                if self._store is not None:
+                    self._store.set(f"metric:{metric}", "ok")
 
         for err in snapshot.service_errors:
             alert = {
@@ -438,13 +446,9 @@ class AlertEngine:
             if self._pass_cooldown(alert):
                 alerts.append(alert)
 
-        # 服务恢复：DOWN -> UP / SKIP 时发送一次恢复通知（状态一并持久化）
+        # 服务恢复：DOWN -> UP / SKIP 时发送一次恢复通知；状态迁移等推送确认后再落盘
         for name, status in snapshot.services.items():
             prev = self._last_services.get(name)
-            if prev != status:
-                self._last_services[name] = status
-                if self._store is not None:
-                    self._store.set(f"service:{name}", status)
             if prev == "DOWN" and status != "DOWN":
                 alert = {
                     "metric": f"service:{name}",
@@ -459,10 +463,36 @@ class AlertEngine:
                 }
                 if self._pass_cooldown(alert):
                     alerts.append(alert)
+                continue
+            if prev != status:
+                # 其余状态迁移（首次观测、SKIP->DOWN、UP->DOWN 等）立即落盘
+                self._last_services[name] = status
+                if self._store is not None:
+                    self._store.set(f"service:{name}", status)
         return alerts
 
     def _pass_cooldown(self, alert: dict) -> bool:
         return self._cooldown.allowed(f"{alert['metric']}:{alert['level']}")
+
+    def confirm_delivered(self, alert: dict) -> None:
+        """告警已成功送达（或未配置 Webhook 已留痕）后确认状态迁移。
+
+        恢复通知只有在推送成功后才把指标/服务状态记为“已恢复”，
+        推送失败则保持告警状态，下一轮会重新生成恢复通知。
+        """
+        if alert["level"] != "Recovery":
+            return
+        metric = alert["metric"]
+        if metric.startswith("service:"):
+            name = metric[len("service:"):]
+            status = alert["value"]
+            self._last_services[name] = status
+            if self._store is not None:
+                self._store.set(f"service:{name}", status)
+        elif metric in _METRIC_FIELD:
+            self._last_levels[metric] = "ok"
+            if self._store is not None:
+                self._store.set(f"metric:{metric}", "ok")
 
     def forget(self, alert: dict) -> None:
         """推送失败后清冷却，允许下一轮重试。"""

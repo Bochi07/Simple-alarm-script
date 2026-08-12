@@ -173,11 +173,14 @@ async def metrics_loop(state_store: StateStore) -> None:
                     "恢复通知" if alert["level"] == "Recovery" else "触发告警",
                     alert["metric"], alert["level"],
                 )
-                if not push_alert(alert):
-                    # 仅在“配置了 Webhook 但推送失败”时重试；
-                    # 未配置 Webhook 时已本地留痕，无需每轮重复写留痕
-                    if DINGTALK_WEBHOOK:
-                        engine.forget(alert)
+                pushed = push_alert(alert)
+                if pushed or not DINGTALK_WEBHOOK:
+                    # 推送成功（或未配置 Webhook 已留痕）后确认状态迁移；
+                    # 未配置 Webhook 时无需每轮重复写留痕。
+                    engine.confirm_delivered(alert)
+                else:
+                    # 配置了 Webhook 但推送失败：清冷却，下一轮立即重试
+                    engine.forget(alert)
         except Exception as exc:
             logger.exception("指标采集循环异常: %s", exc)
         if _shutdown.is_set():

@@ -1,12 +1,13 @@
 [Unit]
 Description=Monitor Agent (metrics + log alerts)
-Documentation=file:/usr/local/bin/test/test/DOCUMENTATION.md
+Documentation=file:__MONITOR_DIR__/DOCUMENTATION.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
+# 安装时由 install.sh 将 __MONITOR_DIR__ 替换为实际安装目录（默认 /opt/monitor-agent）
 # 密钥与按主机配置通过 /etc/monitor-agent/env 注入（install.sh systemd 会自动生成模板）
 # 缺省时忽略该文件，告警仅本地留痕
 EnvironmentFile=-/etc/monitor-agent/env
@@ -15,7 +16,7 @@ Environment=PID_FILE=/run/monitor-agent/monitor-agent.pid
 Environment=ALERT_HISTORY_FILE=/var/lib/monitor-agent/alerts.jsonl
 Environment=ALERT_STATE_FILE=/var/lib/monitor-agent/alert-state.json
 Environment=SKIP_NOTIFY_FILE=/var/lib/monitor-agent/skip-notified.json
-ExecStart=/usr/bin/python3 /usr/local/bin/test/test/main.py
+ExecStart=/usr/bin/python3 __MONITOR_DIR__/main.py
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
@@ -24,6 +25,7 @@ RuntimeDirectory=monitor-agent
 StateDirectory=monitor-agent
 LogsDirectory=monitor-agent
 NoNewPrivileges=true
+ProtectHome=true
 PrivateTmp=true
 ProtectSystem=full
 ReadWritePaths=/var/lib/monitor-agent /run/monitor-agent /var/log/monitor-agent

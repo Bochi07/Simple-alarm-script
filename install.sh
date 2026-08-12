@@ -9,22 +9,28 @@
 #   sudo bash install.sh uninstall       # 完全卸载（停止服务 + 删除已安装文件，备份保留）
 #
 # 行为：
-#   1. 备份 /usr/local/bin/test/test 下现有文件到 test.bak-<时间戳>
-#   2. 用 /home/king/monitor-agent 的完善版覆盖安装
-#   3. 刷新 /usr/local/bin/test/test.zip（若本机有 zip 命令）
-#   4. systemd 模式：注册 monitor-agent.service 开机自启并立即启动，
-#      同时生成 /etc/monitor-agent/env 密钥模板（root 600）
+#   1. 源目录自动定位为本脚本所在目录（克隆仓库后直接运行即可，不依赖固定路径）；
+#   2. 备份目标目录现有文件到 <目标目录>.bak-<时间戳>；
+#   3. 覆盖安装核心代码、README、DOCUMENTATION、配置示例、requirements 与 systemd 模板；
+#   4. 刷新 <目标目录>.zip 归档（若本机有 zip 命令，旧包同样留备份）；
+#   5. systemd 模式：注册 monitor-agent.service 开机自启并立即启动，
+#      同时生成 /etc/monitor-agent/env 密钥模板（root:root 0600）。
+#
+# 安装位置默认 /opt/monitor-agent，可用环境变量覆盖：
+#   sudo MONITOR_AGENT_DIR=/usr/local/monitor-agent bash install.sh systemd
 set -euo pipefail
 
-SRC=/home/king/monitor-agent
-DST=/usr/local/bin/test/test
+# 源目录 = 脚本自身所在目录（处理符号链接场景）
+SRC=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+DST=${MONITOR_AGENT_DIR:-/opt/monitor-agent}
+APP_ZIP=${DST}.zip
 SERVICE_NAME=monitor-agent.service
 UNIT_PATH=/etc/systemd/system/${SERVICE_NAME}
 ETC_DIR=/etc/monitor-agent
 ENV_FILE=${ETC_DIR}/env
-CONFIG_EXAMPLE=/etc/monitor-agent/config.example.json
+CONFIG_EXAMPLE=${ETC_DIR}/config.example.json
 TS=$(date +%Y%m%d-%H%M%S)
-BAK=/usr/local/bin/test/test.bak-${TS}
+BAK=${DST}.bak-${TS}
 
 MODE="${1:-files}"
 
@@ -50,8 +56,10 @@ install_files() {
     cp -p "$SRC"/README.md "$SRC"/DOCUMENTATION.md "$DST"/
     cp -p "$SRC"/requirements.txt "$SRC"/config.example.json "$DST"/
     mkdir -p "$DST"/deploy
-    cp -p "$SRC"/deploy/monitor-agent.service.example "$DST"/deploy/
-    chmod 755 "$DST"/*.py "$DST"/README.md "$DST"/DOCUMENTATION.md
+    sed "s|__MONITOR_DIR__|${DST//&/\\&}|g" \
+        "$SRC"/deploy/monitor-agent.service.example \
+        > "$DST"/deploy/monitor-agent.service.example
+    chmod 755 "$DST"/*.py
     echo "[2/5] 已完成覆盖安装到 $DST"
 
     if command -v python3 >/dev/null 2>&1; then
@@ -62,15 +70,15 @@ install_files() {
     fi
 
     if command -v zip >/dev/null 2>&1; then
-        cp -p /usr/local/bin/test/test.zip /usr/local/bin/test/test.zip.bak-${TS} 2>/dev/null || true
+        cp -p "$APP_ZIP" "$APP_ZIP.bak-${TS}" 2>/dev/null || true
         tmp=$(mktemp)
         rm -f "$tmp"
         (cd "$DST" && zip -q -r "$tmp" . -x '__pycache__/*' -x '*.pyc')
-        cp -p "$tmp" /usr/local/bin/test/test.zip
+        cp -p "$tmp" "$APP_ZIP"
         rm -f "$tmp"
-        echo "[4/5] 已刷新 test.zip（旧包备份为 test.zip.bak-${TS}）"
+        echo "[4/5] 已刷新 $APP_ZIP（旧包备份为 $APP_ZIP.bak-${TS}）"
     else
-        echo "[4/5] 跳过 test.zip 刷新（未找到 zip 命令）"
+        echo "[4/5] 跳过 zip 归档刷新（未找到 zip 命令）"
     fi
 
     echo "[5/5] 程序文件安装完成"
@@ -111,6 +119,9 @@ DINGTALK_SECRET=
 # MONITOR_INTERVAL=60
 # LOG_SCAN_INTERVAL=10
 # ALERT_COOLDOWN=300
+# 阈值覆盖示例（默认见 DOCUMENTATION.md）
+# CPU_PERCENT_WARNING=85
+# CPU_PERCENT_CRITICAL=97
 # ALERT_STATE_FILE=/var/lib/monitor-agent/alert-state.json
 EOF
     chmod 600 "$ENV_FILE"
@@ -122,7 +133,9 @@ install_systemd() {
     install_files
     echo
     echo "== 注册 systemd 开机自启 =="
-    cp -p "$SRC"/deploy/monitor-agent.service.example "$UNIT_PATH"
+    sed "s|__MONITOR_DIR__|${DST//&/\\&}|g" \
+        "$SRC"/deploy/monitor-agent.service.example > "$UNIT_PATH"
+    chmod 644 "$UNIT_PATH"
     echo "  [OK] 已安装服务单元: $UNIT_PATH"
     write_env_template
     systemctl daemon-reload
@@ -151,11 +164,11 @@ uninstall_all() {
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
     rm -f "$UNIT_PATH"
     systemctl daemon-reload
-    rm -f /usr/local/bin/test/test.zip
+    rm -f "$APP_ZIP"
     rm -rf "$DST"
-    echo "  [OK] 已删除服务单元、$DST 与 test.zip"
+    echo "  [OK] 已删除服务单元、$DST 与 $APP_ZIP"
     echo "  [提示] 程序文件备份仍保留在:"
-    ls -d /usr/local/bin/test/test.bak-* 2>/dev/null || echo "    （无备份）"
+    ls -d "$DST".bak-* 2>/dev/null || echo "    （无备份）"
 }
 
 case "$MODE" in

@@ -50,17 +50,43 @@ LOG_BACKUPS = int(os.getenv("MONITOR_LOG_BACKUPS", "2"))
 # ============ 告警/恢复状态持久化（跨重启续用冷却与恢复判定） ============
 ALERT_STATE_FILE = Path(os.getenv("ALERT_STATE_FILE", str(_STATE_DIR / "alert-state.json")))
 
-# ============ 分级阈值（Warning / Critical） ============
-THRESHOLDS = {
+# 配置加载过程中的错误收集（供 validate() 汇总，启动时以 fatal 中止）
+_CONFIG_LOAD_ERRORS: list[str] = []
+
+# ============ 分级阈值（Warning / Critical，可环境变量覆盖） ============
+# 覆盖方式：<指标名大写>_WARNING / <指标名大写>_CRITICAL，例如：
+#   CPU_PERCENT_WARNING=85   CPU_PERCENT_CRITICAL=97
+#   MEMORY_PERCENT_WARNING=85  MEMORY_PERCENT_CRITICAL=95
+_DEFAULT_THRESHOLDS = {
     "cpu_percent": {"warning": 80.0, "critical": 95.0, "unit": "%"},
     "memory_percent": {"warning": 80.0, "critical": 92.0, "unit": "%"},
     "disk_percent": {"warning": 80.0, "critical": 90.0, "unit": "%"},
     "temperature_c": {"warning": 70.0, "critical": 85.0, "unit": "℃"},
 }
 
+
+def _load_thresholds() -> dict:
+    """读取阈值默认值，并用 <指标名>_WARNING / _CRITICAL 环境变量覆盖。"""
+    thresholds = {name: dict(rule) for name, rule in _DEFAULT_THRESHOLDS.items()}
+    for name, rule in thresholds.items():
+        for env_key, field in (
+            (f"{name.upper()}_WARNING", "warning"),
+            (f"{name.upper()}_CRITICAL", "critical"),
+        ):
+            raw = os.getenv(env_key, "").strip()
+            if not raw:
+                continue
+            try:
+                rule[field] = float(raw)
+            except ValueError:
+                _CONFIG_LOAD_ERRORS.append(f"{env_key} 不是合法数字: {raw!r}")
+    return thresholds
+
+
+THRESHOLDS = _load_thresholds()
+
 # ============ 配置注入：JSON 配置文件 > 环境变量 > 默认值 ============
 CONFIG_FILE = os.getenv("MONITOR_CONFIG_FILE", "").strip()
-_CONFIG_LOAD_ERRORS: list[str] = []
 
 
 def _load_config_file() -> dict:

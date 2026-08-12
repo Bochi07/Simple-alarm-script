@@ -8,8 +8,11 @@
 ## 快速开始
 
 ```bash
+# 获取代码
+git clone git@github.com:Bochi07/Simple-alarm-script.git
+cd Simple-alarm-script
+
 # 依赖
-pip install psutil
 pip install -r requirements.txt
 
 # 配置环境变量（敏感信息一律走环境变量，代码内不保留默认凭据）
@@ -23,20 +26,30 @@ python3 main.py --selftest
 python3 main.py
 ```
 
-如果目标位置是 `/usr/local/bin/test/test`（本仓库的原始部署位置），
-用 root 运行安装脚本即可备份旧文件并覆盖安装：
-
-```bash
-sudo bash install.sh
-```
-
-需要**开机自启（root，不占终端）**时，一条命令完成安装 + 注册 systemd 服务：
-
-```bash
-sudo bash install.sh systemd
-```
-
 未配置 `DINGTALK_WEBHOOK` 时，告警只写入本地留痕文件，不推送钉钉。
+
+## 生产部署（systemd 开机自启）
+
+安装脚本源目录自动定位为仓库自身（克隆后直接在仓库里运行即可），
+默认安装到 `/opt/monitor-agent`：
+
+```bash
+sudo bash install.sh             # 仅安装/升级程序文件
+sudo bash install.sh systemd     # 安装 + 注册开机自启并立即启动
+sudo nano /etc/monitor-agent/env # 填入 DINGTALK_WEBHOOK（可选）
+sudo systemctl restart monitor-agent
+journalctl -u monitor-agent -f
+```
+
+自定义安装位置（可选）：
+
+```bash
+sudo MONITOR_AGENT_DIR=/usr/local/monitor-agent bash install.sh systemd
+```
+
+注意：读取 `/var/log/nginx/error.log` 与 `/var/run/docker.sock` 需要 root 权限，
+systemd 服务以 `User=root` 运行；取消自启用 `sudo bash install.sh systemd-remove`，
+完全卸载用 `sudo bash install.sh uninstall`。
 
 ## 按主机配置服务与日志监控
 
@@ -79,7 +92,8 @@ JSON 数组：`MONITOR_SERVICES` / `MONITOR_LOG_JOBS`。
 （`SKIP_NOTIFY_FILE`），开机/重启不会重复发送；删除该标记文件可重新触发。
 
 服务恢复（DOWN->UP / 判定未安装跳过）、指标回落、日志事件停止出现时，
-都会发送 **“已恢复”通知**；冷却、告警级别、服务状态会持久化到
+都会发送 **“已恢复”通知**；恢复通知在推送成功后才落盘状态，
+推送失败会下一轮重试，不会丢失。冷却、告警级别、服务状态持久化到
 `alert-state.json`，进程重启后不会立刻重复告警。
 
 ## 环境变量
@@ -97,6 +111,10 @@ JSON 数组：`MONITOR_SERVICES` / `MONITOR_LOG_JOBS`。
 | `PUSH_TIMEOUT` | 5 | 单次 HTTP 推送超时（秒） |
 | `PUSH_MAX_RETRIES` | 3 | 推送失败重试次数（指数退避） |
 | `PUSH_RETRY_BACKOFF` | 2.0 | 首次退避基数（秒） |
+| `CPU_PERCENT_WARNING` / `CPU_PERCENT_CRITICAL` | 80 / 95 | CPU 分级阈值覆盖 |
+| `MEMORY_PERCENT_WARNING` / `MEMORY_PERCENT_CRITICAL` | 80 / 92 | 内存分级阈值覆盖 |
+| `DISK_PERCENT_WARNING` / `DISK_PERCENT_CRITICAL` | 80 / 90 | 磁盘分级阈值覆盖 |
+| `TEMPERATURE_C_WARNING` / `TEMPERATURE_C_CRITICAL` | 70 / 85 | 温度分级阈值覆盖 |
 | `MONITOR_STATE_DIR` | `~/.local/state/monitor-agent` | 状态目录 |
 | `ALERT_HISTORY_FILE` | 状态目录/`alerts.jsonl` | 告警留痕（自动轮转） |
 | `ALERT_HISTORY_MAX_BYTES` | 10485760 | 留痕轮转阈值（字节） |
@@ -105,36 +123,20 @@ JSON 数组：`MONITOR_SERVICES` / `MONITOR_LOG_JOBS`。
 | `SKIP_NOTIFY_FILE` | 状态目录/`skip-notified.json` | SKIP 一次性通知标记 |
 | `SKIP_NOTIFY_ONCE` | 1 | 是否启用 SKIP 首次通知（0 关闭） |
 | `MONITOR_LOG_FILE` | 状态目录/`monitor-agent.log` | 运行日志文件（设空串则仅 stdout，供 journald） |
+| `MONITOR_LOG_MAX_BYTES` | 5242880 | 运行日志轮转阈值（字节） |
+| `MONITOR_LOG_BACKUPS` | 2 | 运行日志备份数 |
 | `LOG_ALERT_MAX_SAMPLES` | 5 | 日志告警附带的示例行数上限 |
 | `MONITOR_SHUTDOWN_TIMEOUT` | 5 | 退出时等待线程池收尾的秒数上限（超时强制退出，避免 SIGTERM 卡死） |
 | `ALERT_STATE_FILE` | 状态目录/`alert-state.json` | 冷却/级别/服务状态持久化文件 |
 
-## 生产部署（systemd）
+## 架构速览
 
-推荐直接用安装脚本注册（自动生成 `/etc/monitor-agent/env` 密钥模板）：
+- 进程启动后创建 asyncio 事件循环，并行运行 `metrics_loop`（指标 + 服务存活）
+  与 `logwatch_loop`（日志语义）两个协程；
+- 指标采集的阻塞 IO（1 秒 CPU 采样、socket 探测、子进程命令）全部提交到
+  应用自有线程池执行，不阻塞事件循环；
+- 告警按“指标:级别 / 日志代码”聚合 + 冷却去抖，冷却与状态跨重启持久化；
+- 钉钉推送失败按 `2s → 4s → 8s` 指数退避重试，仍失败则本地留痕、下轮重试；
+- 恢复通知推送成功后才落盘“已恢复”状态，推送失败不丢失。
 
-```bash
-sudo bash /home/king/monitor-agent/install.sh systemd
-sudo nano /etc/monitor-agent/env      # 填入 DINGTALK_WEBHOOK（可选）
-sudo systemctl restart monitor-agent
-journalctl -u monitor-agent -f
-```
-
-注意：读取 `/var/log/nginx/error.log` 与 `/var/run/docker.sock` 需要 root 权限，
-服务以 `User=root` 运行；卸载自启用 `sudo bash install.sh systemd-remove`。
-
-## 设计要点
-
-- **单实例锁**：PID 文件 + 存活检测，防止重复启动造成重复告警；
-- **日志告警聚合**：同一日志代码的多次命中合并为一条告警，并套用冷却窗口，
-  避免 502 刷屏或 OOMKilled 容器每 10 秒推一条；
-- **推送重试**：钉钉推送指数退避重试，仍失败则本地留痕、下一轮重试；
-- **诊断阈值统一**：日志联动诊断引用 `config.THRESHOLDS`，不重复硬编码；
-- **阻塞隔离**：指标采集的阻塞 IO 在线程池执行，不卡事件循环；
-- **留痕轮转**：`alerts.jsonl` 超阈值自动滚动为 `.1/.2`。
-- **恢复通知**：指标回落 / 服务 DOWN->UP / 日志事件停止出现时发送“已恢复”；
-- **状态持久化**：冷却与告警级别落盘，重启不重复告警、恢复判定可接续；
-- **运行日志默认落盘**：状态目录 `monitor-agent.log` 自动轮转，
-  设 `MONITOR_LOG_FILE=` 可仅输出 stdout 给 journald；
-- **可移植性**：服务/日志清单按主机配置，未部署的服务自动 SKIP 不误报；
-  /proc 通道在非 Linux 环境自动回退 psutil，服务探测优先查监听表、不依赖建 socket。
+完整机制、配置参考与故障排查见 **`DOCUMENTATION.md`**。
