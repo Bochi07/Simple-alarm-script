@@ -54,6 +54,30 @@ _METRIC_FIELD = {
     "temperature_c": "temperature_c",
 }
 
+# 服务状态色点（钉钉消息中仅用这三个圆圈表示 UP / DOWN / SKIP）
+_STATUS_ICON = {"UP": "🟢", "DOWN": "🔴", "SKIP": "🟡"}
+
+# 指标/消息友好名称（用于钉钉标题与字段展示）
+_DISPLAY_NAME = {
+    "cpu_percent": "CPU 使用率",
+    "memory_percent": "内存使用率",
+    "disk_percent": "磁盘使用率",
+    "temperature_c": "温度",
+    "load1": "系统负载",
+    "startup:report": "开机状态播报",
+    "service:skip:first-run": "服务自动跳过通知",
+}
+
+
+def _display_metric(metric: str) -> str:
+    """把内部指标名转成消息里更易读的名称。"""
+    if metric.startswith("log:"):
+        return metric[len("log:"):]
+    if metric.startswith("service:"):
+        return metric[len("service:"):]
+    return _DISPLAY_NAME.get(metric, metric)
+
+
 # 可执行运维建议库
 _OPS_ADVICE = {
     "cpu_percent": "排查高占用进程：ps -eo pid,user,%cpu,comm --sort=-%cpu | head -20；"
@@ -220,24 +244,36 @@ def _sign(url: str, secret: str) -> str:
 
 
 def _build_alert_payload(alert: dict) -> str:
-    """构造钉钉 markdown 消息 JSON 体：时间戳/实际值/阈值/诊断/建议一应俱全。"""
+    """构造钉钉 markdown 消息 JSON 体：左对齐、字段加粗、状态用色点圆圈。
+
+    告警 dict 可携带可选字段 body（已排版好的复合内容，如开机播报/SKIP 明细/
+    日志样本）；没有 body 时按 指标/当前值/触发阈值 标准字段渲染。
+    """
+    label = _display_metric(alert["metric"])
     if alert["level"] == "Recovery":
-        title = f"[恢复] {alert['metric']} 已恢复正常"
+        title = f"[恢复] {label} 已恢复正常"
+        heading = f"## 恢复 - {label}"
     else:
-        title = f"[{alert['level']}] 告警 - {alert['metric']}"
-    sections = [
-        f"### {title}",
-        f"**主机**：{alert['hostname']}",
-        f"**时间**：{alert['timestamp']}",
-        f"**指标**：{alert['metric']}（单位 {alert.get('unit', '-')}）",
-        f"**当前值**：{alert['value']}",
-        f"**触发阈值**：{alert['threshold']}",
-    ]
+        title = f"[{alert['level']}] 告警 - {label}"
+        heading = f"## 告警 - {label}（{alert['level']}）"
+
+    lines = [heading, "", f"**主机**：{alert['hostname']}", f"**时间**：{alert['timestamp']}"]
+    body = alert.get("body")
+    if body:
+        lines += ["", body]
+    else:
+        lines += [
+            "",
+            f"**指标**：{label}（单位 {alert.get('unit', '-')}）",
+            f"**当前值**：{alert.get('value', '-')}",
+        ]
+        threshold = alert.get("threshold", "-")
+        if threshold != "-":
+            lines.append(f"**触发阈值**：{threshold}")
     if alert.get("diagnosis"):
-        sections.append(f"**根因诊断**：{alert['diagnosis']}")
-    sections.append("**建议措施**：")
-    sections.append(f"> {alert['advice']}")
-    text = "\n\n".join(sections)
+        lines += ["", f"**根因诊断**：{alert['diagnosis']}"]
+    lines += ["", "**建议措施**", f"> {alert['advice']}"]
+    text = "\n".join(lines)
     return json.dumps({
         "msgtype": "markdown",
         "markdown": {"title": title, "text": text},
@@ -311,15 +347,16 @@ async def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str
     if _skip_notified() is not None:
         return False
 
-    lines = "\n".join(
-        f"- **{s.get('name', '?')}**：{s.get('detail', '未检测到安装痕迹，已自动跳过')}"
+    body = "\n".join(
+        f"- {s.get('name', '?')}：🟡 {s.get('detail', '未检测到安装痕迹，已自动跳过')}"
         for s in skipped
     )
     alert = {
         "metric": "service:skip:first-run",
         "hostname": hostname,
         "timestamp": timestamp,
-        "value": lines,
+        "value": f"{len(skipped)} 个服务未安装，已自动跳过",
+        "body": body,
         "threshold": "-",
         "level": "Info",
         "unit": "-",
@@ -337,6 +374,51 @@ async def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str
     return False
 
 
+def _build_startup_report(snapshot: MetricSnapshot) -> tuple[str, str]:
+    """组装开机播报的 (value, body)：value 为一行摘要，body 为钉钉正文。
+
+    正文左对齐，服务状态仅用色点圆圈（🟢/🔴/🟡）表示，段落间用空行分隔，
+    避免钉钉 markdown 把单换行渲染成空格粘连。
+    """
+    services = snapshot.services or {}
+    up = [n for n, s in services.items() if s == "UP"]
+    down = [n for n, s in services.items() if s == "DOWN"]
+    skipped = [n for n, s in services.items() if s == "SKIP"]
+    err_detail = {e["service"]: e.get("detail", "") for e in snapshot.service_errors}
+
+    body_lines = ["**系统指标**", ""]
+    body_lines.append(
+        f"- CPU：{snapshot.cpu_percent:.1f}% ｜ 内存：{snapshot.memory_percent:.1f}% ｜ "
+        f"磁盘：{snapshot.disk_percent:.1f}%"
+    )
+    body_lines.append(f"- 负载：{snapshot.load1:.2f} ｜ 温度：{snapshot.temperature_c:.1f}℃")
+    body_lines += ["", "**服务状态**"]
+    if services:
+        for name in sorted(services):
+            status = services[name]
+            mark = _STATUS_ICON.get(status, "•")
+            if status == "DOWN":
+                detail = err_detail.get(name, "")
+                body_lines.append(f"- {name}：{mark} DOWN（{detail or '探测异常'}）")
+            elif status == "SKIP":
+                body_lines.append(f"- {name}：{mark} SKIP（未检测到安装痕迹，已自动跳过）")
+            else:
+                body_lines.append(f"- {name}：{mark} UP")
+    else:
+        body_lines.append("- （未配置服务监控）")
+    body_lines += [
+        "",
+        f"**汇总**：🟢 UP {len(up)} ｜ 🔴 DOWN {len(down)} ｜ 🟡 SKIP {len(skipped)}"
+    ]
+
+    value = (
+        f"CPU {snapshot.cpu_percent:.1f}% / 内存 {snapshot.memory_percent:.1f}% / "
+        f"磁盘 {snapshot.disk_percent:.1f}% / 负载 {snapshot.load1:.2f} / "
+        f"温度 {snapshot.temperature_c:.1f}℃"
+    )
+    return value, "\n".join(body_lines)
+
+
 async def notify_startup_report(snapshot: MetricSnapshot) -> bool:
     """进程启动后首次采集完成时，发送一次开机状态播报。
 
@@ -348,37 +430,13 @@ async def notify_startup_report(snapshot: MetricSnapshot) -> bool:
     - 配置了 Webhook 但推送失败：返回 False，本进程内不重试（留痕已写入，
       下次进程启动会再发一次）。
     """
-    services = snapshot.services or {}
-    up = [n for n, s in services.items() if s == "UP"]
-    down = [n for n, s in services.items() if s == "DOWN"]
-    skipped = [n for n, s in services.items() if s == "SKIP"]
-    err_detail = {e["service"]: e.get("detail", "") for e in snapshot.service_errors}
-
-    metric_line = (
-        f"CPU {snapshot.cpu_percent:.1f}% | 内存 {snapshot.memory_percent:.1f}% | "
-        f"磁盘 {snapshot.disk_percent:.1f}% | 负载 {snapshot.load1:.2f} | "
-        f"温度 {snapshot.temperature_c:.1f}℃"
-    )
-    lines = [f"**系统指标**：{metric_line}", "**服务状态**："]
-    if services:
-        for name in sorted(services):
-            status = services[name]
-            if status == "DOWN":
-                detail = err_detail.get(name, "")
-                lines.append(f"- {name}：**DOWN**（{detail or '探测异常'}）")
-            elif status == "SKIP":
-                lines.append(f"- {name}：SKIP（未检测到安装痕迹，已自动跳过）")
-            else:
-                lines.append(f"- {name}：UP")
-    else:
-        lines.append("- （未配置服务监控）")
-    lines.append(f"**汇总**：UP {len(up)} 个 / DOWN {len(down)} 个 / SKIP {len(skipped)} 个")
-
+    value, body = _build_startup_report(snapshot)
     alert = {
         "metric": "startup:report",
         "hostname": snapshot.hostname,
         "timestamp": snapshot.timestamp,
-        "value": "\n".join(lines),
+        "value": value,
+        "body": body,
         "threshold": "-",
         "level": "Info",
         "unit": "-",
@@ -524,7 +582,7 @@ class AlertEngine:
                 "metric": f"service:{err['service']}",
                 "hostname": snapshot.hostname,
                 "timestamp": snapshot.timestamp,
-                "value": "DOWN",
+                "value": "🔴 DOWN",
                 "threshold": "期望 UP",
                 "level": "Critical",
                 "unit": "-",
@@ -541,7 +599,7 @@ class AlertEngine:
                     "metric": f"service:{name}",
                     "hostname": snapshot.hostname,
                     "timestamp": snapshot.timestamp,
-                    "value": status,
+                    "value": f"{_STATUS_ICON.get(status, '')} {status}",
                     "threshold": "期望 UP",
                     "level": "Recovery",
                     "unit": "-",

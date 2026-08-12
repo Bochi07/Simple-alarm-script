@@ -224,14 +224,17 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 if not cooldown.allowed(f"log:{code}"):
                     continue
                 samples = group[:LOG_ALERT_MAX_SAMPLES]
-                value = f"命中 {len(group)} 条"
+                body = f"命中 {len(group)} 条"
                 if samples:
-                    value += "\n" + "\n".join(s["line"][:180] for s in samples)
+                    body += "\n\n" + "\n".join(
+                        f"- {s['line'][:180]}" for s in samples if s["line"].strip()
+                    )
                 alert = {
                     "metric": f"log:{code}",
                     "hostname": group[0]["hostname"],
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "value": value,
+                    "value": f"命中 {len(group)} 条",
+                    "body": body,
                     "threshold": "-",
                     "level": "Critical",
                     "unit": "-",
