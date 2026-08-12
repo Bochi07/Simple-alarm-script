@@ -183,7 +183,9 @@ _env_services = _load_json_env("MONITOR_SERVICES")
 SERVICES = _file_cfg.get("services", _env_services if _env_services is not None else DEFAULT_SERVICES)
 
 # ============ 关键错误日志语义监控 ============
-# 文件型（path）基于文件 offset 增量读取；命令型（command）定时执行后全文匹配。
+# 文件型（path / paths）基于文件 offset 增量读取；命令型（command）定时执行后全文匹配。
+# path：单个日志路径；paths：候选路径数组，按序探测，先到先用（兼容宝塔/源码编译等
+# 非标准安装位置）；两者都不存在时自动按常见安装位置回退探测，全部失败才跳过。
 _env_log_jobs = _load_json_env("MONITOR_LOG_JOBS")
 LOG_JOBS = _file_cfg.get("log_jobs", _env_log_jobs if _env_log_jobs is not None else DEFAULT_LOG_JOBS)
 
@@ -256,9 +258,16 @@ def validate() -> list[tuple[str, str]]:
     for job in LOG_JOBS:
         if not job.get("name") or not job.get("patterns"):
             problems.append(("fatal", f"日志任务缺少 name/patterns: {job}"))
-        elif not job.get("path") and not job.get("command"):
-            problems.append(("fatal", f"日志任务 {job.get('name')} 必须配置 path 或 command"))
+        elif not job.get("path") and not job.get("paths") and not job.get("command"):
+            problems.append(("fatal", f"日志任务 {job.get('name')} 必须配置 path/paths 或 command"))
         else:
+            paths = job.get("paths")
+            if paths is not None and (
+                not isinstance(paths, list)
+                or not paths
+                or any(not isinstance(p, str) or not p for p in paths)
+            ):
+                problems.append(("fatal", f"日志任务 {job.get('name')} 的 paths 必须是非空字符串数组"))
             import re
             for pattern, code, desc in job["patterns"]:
                 if not code or not desc:

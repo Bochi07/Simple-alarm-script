@@ -247,6 +247,18 @@ python3 main.py
 }
 ```
 
+文件型日志任务的路径支持两种写法：
+
+- `path`：单个日志路径，最常用；
+- `paths`：候选路径数组，按顺序探测、先到先用，适合非标准安装位置
+  （如宝塔面板的 `/www/server/nginx/logs/error.log`、源码编译的
+  `/usr/local/nginx/logs/error.log`）。
+
+即使只配了 `path` 且文件不存在，也会自动按常见 nginx 安装位置回退探测同名日志
+（`/var/log/nginx`、`/www/server/nginx/logs`、`/usr/local/nginx/logs`、
+`/opt/nginx/logs`、`/etc/nginx/logs`、`/www/wwwlogs`），全部找不到才跳过该任务，
+不影响其他监控。
+
 systemd 方式则把 `MONITOR_CONFIG_FILE=/etc/monitor-agent/config.json` 写入
 `/etc/monitor-agent/env` 后重启服务。
 

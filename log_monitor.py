@@ -26,6 +26,68 @@ from config import COMMAND_SHELL, DIAGNOSTICS, LOG_COMMAND_TIMEOUT, LOG_JOBS, TH
 
 logger = logging.getLogger("monitor.logwatch")
 
+# 文件型日志自动探测的常见安装位置（仅当配置的 path/paths 都不存在时按序尝试）：
+# 覆盖系统源安装（/var/log/nginx）、宝塔面板（/www/server/nginx/logs）、
+# 源码编译（/usr/local/nginx、/opt/nginx、/etc/nginx）与宝塔站点日志（/www/wwwlogs）。
+# 其余场景请直接在任务里配置 paths 数组显式指定候选路径。
+_LOG_PATH_FALLBACK_ROOTS = (
+    Path("/var/log/nginx"),
+    Path("/www/server/nginx/logs"),
+    Path("/usr/local/nginx/logs"),
+    Path("/opt/nginx/logs"),
+    Path("/etc/nginx/logs"),
+    Path("/www/wwwlogs"),
+)
+
+
+def _resolve_log_path(job: dict) -> Path | None:
+    """解析文件型日志任务的实际日志路径。
+
+    候选顺序：job["paths"]（若配置，按序探测）→ job["path"] →
+    常见安装位置回退（同名文件）。全部不存在返回 None，调用方跳过该任务。
+    """
+    candidates: list[str] = []
+    for p in job.get("paths") or []:
+        if isinstance(p, str) and p:
+            candidates.append(p)
+    if job.get("path"):
+        primary = str(job["path"])
+        if primary not in candidates:
+            candidates.insert(0, primary)
+    if not candidates:
+        logger.warning("日志任务 %s 缺少有效路径（path/paths）", job.get("name", "?"))
+        return None
+
+    for cand in candidates:
+        p = Path(cand)
+        if _is_readable_file(p):
+            return p
+
+    # 配置的路径不存在：按常见安装位置回退探测同名日志（如 error.log）
+    first_name = Path(candidates[0]).name
+    for root in _LOG_PATH_FALLBACK_ROOTS:
+        fallback = root / first_name
+        if _is_readable_file(fallback):
+            logger.info(
+                "日志路径自动探测命中: %s（配置为 %s，原路径不存在）",
+                fallback, candidates[0],
+            )
+            return fallback
+
+    logger.warning(
+        "日志文件均不存在，跳过该任务（已尝试 %s）: %s",
+        "、".join(candidates), job.get("name", "?"),
+    )
+    return None
+
+
+def _is_readable_file(p: Path) -> bool:
+    """文件存在且可读才返回 True；父目录无权限等 stat 异常按不可用处理。"""
+    try:
+        return p.is_file() and os.access(p, os.R_OK)
+    except OSError:
+        return False
+
 
 class LogEvent:
     """单条命中日志事件的标准化载体。"""
@@ -52,14 +114,15 @@ class LogEvent:
 class FileLogWatcher:
     """文件型日志轮询器：offset 增量读取 + 正则匹配。"""
 
-    def __init__(self, path: str, patterns: list):
-        self.path = Path(path)
+    def __init__(self, path: Path | None, patterns: list, name: str = "?"):
+        self.name = name
+        self.path = path
         self.patterns = [(re.compile(p), code, desc) for p, code, desc in patterns]
-        self.offset = self.path.stat().st_size if self.path.is_file() else 0
+        self.offset = self.path.stat().st_size if self.path is not None and self.path.is_file() else 0
 
     def poll(self, hostname: str) -> list:
         # 文件不存在/是目录/被删时直接返回空，等文件恢复后再监控（避免每轮异常刷屏）
-        if not self.path.is_file():
+        if self.path is None or not self.path.is_file():
             return []
         size = self.path.stat().st_size
         if size < self.offset:      # 日志被截断或轮转，重置偏移
@@ -156,8 +219,9 @@ class LogSemanticEngine:
         watchers: list = []
         for job in LOG_JOBS:
             try:
-                if "path" in job:
-                    watchers.append(FileLogWatcher(job["path"], job["patterns"]))
+                if "path" in job or "paths" in job:
+                    resolved = _resolve_log_path(job)
+                    watchers.append(FileLogWatcher(resolved, job["patterns"], job.get("name", "?")))
                 else:
                     watchers.append(CommandLogWatcher(job["command"], job["patterns"]))
             except Exception as exc:

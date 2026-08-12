@@ -168,6 +168,7 @@ DINGTALK_SECRET=
 # MONITOR_CONFIG_FILE=/etc/monitor-agent/config.json
 # MONITOR_SERVICES=[{"name":"nginx","process_names":["nginx"],"port":80}]
 # MONITOR_LOG_JOBS=[{"name":"nginx_error","path":"/var/log/nginx/error.log","patterns":[["connect\\(\\) failed","NGINX_UPSTREAM_FAIL","Nginx 后端网关异常"]]}]
+# 非标准安装位置可用 paths 数组按序探测，如 paths:["/var/log/nginx/error.log","/www/server/nginx/logs/error.log"]
 
 # 采集与告警参数（可选，默认值见 README.md）
 # MONITOR_INTERVAL=60

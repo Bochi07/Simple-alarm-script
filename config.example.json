@@ -15,7 +15,11 @@
   "log_jobs": [
     {
       "name": "nginx_error",
-      "path": "/var/log/nginx/error.log",
+      "paths": [
+        "/var/log/nginx/error.log",
+        "/www/server/nginx/logs/error.log",
+        "/usr/local/nginx/logs/error.log"
+      ],
       "patterns": [
         ["upstream\\s+.*?(?:connect\\(\\) failed|timed out|prematurely closed|500|502|503|504)",
          "NGINX_UPSTREAM_FAIL",
