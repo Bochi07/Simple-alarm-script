@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-
 """
 监控告警中间件主入口（单进程常驻，asyncio 异步调度）。
 
@@ -23,7 +20,10 @@ from __future__ import annotations
   - 状态持久化：冷却、告警级别、服务状态跨重启续用，重启不重复告警；
   - 优雅退出（SIGINT/SIGTERM），可选文件日志（配合 systemd）。
 """
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -37,12 +37,13 @@ from pathlib import Path
 import psutil
 
 from alerting import (
+    PUSH_ABORT,
     AlertEngine,
     Cooldown,
     LogRecoveryTracker,
-    PUSH_ABORT,
     StateStore,
     notify_skipped_once,
+    notify_startup_report,
     push_alert_async,
 )
 from collectors import EXECUTOR as COLLECT_EXECUTOR
@@ -61,6 +62,7 @@ from config import (
     LOG_SCAN_INTERVAL,
     PID_FILE,
     SHUTDOWN_TIMEOUT,
+    STARTUP_NOTIFY,
     validate,
 )
 from log_monitor import LogSemanticEngine
@@ -131,10 +133,8 @@ def _acquire_pid_lock() -> None:
 def _release_pid_lock() -> None:
     global _pid_fd
     if _pid_fd is not None:
-        try:
+        with contextlib.suppress(OSError):
             os.close(_pid_fd)
-        except OSError:
-            pass
         _pid_fd = None
     try:
         if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
@@ -148,7 +148,7 @@ async def metrics_loop(state_store: StateStore) -> None:
     """指标采集 + 阈值告警循环。"""
     global latest_snapshot
     engine = AlertEngine(store=state_store)
-    skip_notice_attempted = False
+    startup_notice_attempted = False
     while not _shutdown.is_set():
         try:
             latest_snapshot = await collect_snapshot()
@@ -161,16 +161,20 @@ async def metrics_loop(state_store: StateStore) -> None:
                 s.disk_used_gb, s.disk_total_gb, s.load1,
                 s.temperature_c, s.services,
             )
-            # 首次启动时，对“配置了但本机未安装（SKIP）”的服务发送一次汇总通知；
-            # 仅尝试一次，推送失败则留给下次进程启动重试，避免每轮轰炸。
-            if not skip_notice_attempted:
-                skip_notice_attempted = True
-                skipped = [
-                    {"name": name, "detail": "未检测到安装痕迹（进程/二进制/socket/监听端口），已自动跳过"}
-                    for name, status in s.services.items()
-                    if status == "SKIP"
-                ]
-                await notify_skipped_once(s.hostname, skipped, s.timestamp)
+            # 首次采集完成后发送一次“开机状态播报”：当前系统指标 + 服务 UP/DOWN/SKIP 明细。
+            # 播报启用时已覆盖 SKIP 信息（内部会标记），故不再走独立的 SKIP 一次性通知；
+            # 关闭播报时回退为仅发送 SKIP 一次性通知。均只尝试一次。
+            if not startup_notice_attempted:
+                startup_notice_attempted = True
+                if STARTUP_NOTIFY:
+                    await notify_startup_report(s)
+                else:
+                    skipped = [
+                        {"name": name, "detail": "未检测到安装痕迹（进程/二进制/socket/监听端口），已自动跳过"}
+                        for name, status in s.services.items()
+                        if status == "SKIP"
+                    ]
+                    await notify_skipped_once(s.hostname, skipped, s.timestamp)
             for alert in engine.evaluate(latest_snapshot):
                 logger.warning(
                     "%s: %s -> %s",
@@ -236,9 +240,8 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 }
                 logger.error("命中关键日志 %s（%d 条），已聚合推送", code, len(group))
                 tracker.persist_seen(code, now)
-                if not await push_alert_async(alert):
-                    if DINGTALK_WEBHOOK:
-                        cooldown.clear(f"log:{code}")
+                if not await push_alert_async(alert) and DINGTALK_WEBHOOK:
+                    cooldown.clear(f"log:{code}")
 
             # 恢复判定：冷却窗口内无新命中 -> 发送一次“已恢复”通知
             for code in tracker.active_codes():

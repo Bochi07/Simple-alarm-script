@@ -1,0 +1,4 @@
+# 开发/测试/CI 依赖（生产仅需 requirements.txt 中的 psutil）
+pytest>=7.0
+ruff>=0.4
+mypy>=1.8

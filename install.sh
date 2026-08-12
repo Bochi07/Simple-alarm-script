@@ -60,8 +60,8 @@ guard_target() {
         exit 1
     fi
     src_canon=$(realpath -m -- "$SRC" 2>/dev/null || printf '%s' "$SRC")
-    if [[ "$canonical" == "$src_canon" ]]; then
-        echo "错误：MONITOR_AGENT_DIR 不能是源码仓库自身: $canonical" >&2
+    if [[ "$canonical" == "$src_canon" || "$canonical" == "$src_canon"/* ]]; then
+        echo "错误：MONITOR_AGENT_DIR 不能是源码仓库自身或其子目录: $canonical" >&2
         echo "       （卸载时会删除该目录，请换一个安装位置，如 /opt/monitor-agent）" >&2
         exit 1
     fi

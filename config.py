@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-
 """
 全局配置：阈值规则、钉钉 Webhook、服务清单与日志监控参数。
 
@@ -11,6 +8,8 @@ from __future__ import annotations
     nginx/docker 的机器上周期性误报 DOWN）；可用 JSON 配置文件或环境变量注入；
   - 启动时调用 validate() 做配置体检，非法配置直接中止。
 """
+from __future__ import annotations
+
 import json
 import os
 from pathlib import Path
@@ -47,6 +46,9 @@ def _env_float(name: str, default: float) -> float:
 COLLECT_INTERVAL = _env_int("MONITOR_INTERVAL", 60)               # 指标采集周期（秒）
 LOG_SCAN_INTERVAL = _env_int("LOG_SCAN_INTERVAL", 10)             # 日志轮询周期（秒）
 ALERT_COOLDOWN = _env_int("ALERT_COOLDOWN", 300)                  # 同类型告警冷却（秒）
+# 采集线程池 worker 数：cpu_percent(interval=1) 等阻塞采集并行执行，
+# 高峰期排队时适当调大（默认 4 兼顾低端机器）。
+COLLECT_WORKERS = _env_int("MONITOR_COLLECT_WORKERS", 4)
 
 # ============ 钉钉机器人（必须通过环境变量注入） ============
 DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK", "").strip()
@@ -71,6 +73,12 @@ PID_FILE = Path(os.getenv("PID_FILE", str(_STATE_DIR / "monitor-agent.pid")))
 # 状态标记文件持久化在状态目录，重启/开机不会重复发送；删除该文件可重新触发。
 SKIP_NOTIFY_FILE = Path(os.getenv("SKIP_NOTIFY_FILE", str(_STATE_DIR / "skip-notified.json")))
 SKIP_NOTIFY_ONCE = os.getenv("SKIP_NOTIFY_ONCE", "1").strip() not in ("0", "false", "no")
+
+# ============ 开机启动状态播报 ============
+# 进程启动后首次采集完成时，向钉钉发送一次启动播报：当前系统指标 +
+# 服务状态总览（UP/DOWN/SKIP 明细）。启用时自动包含并标记 SKIP 通知，
+# 因此不会与 SKIP 一次性通知重复发送。设 0 关闭，回退为仅 SKIP 通知。
+STARTUP_NOTIFY = os.getenv("STARTUP_NOTIFY", "1").strip() not in ("0", "false", "no")
 
 # ============ 运行日志（默认落盘状态目录并轮转；设空串则仅 stdout，供 journald） ============
 LOG_FILE = os.getenv("MONITOR_LOG_FILE", str(_STATE_DIR / "monitor-agent.log"))
@@ -182,6 +190,30 @@ LOG_JOBS = _file_cfg.get("log_jobs", _env_log_jobs if _env_log_jobs is not None 
 # 日志告警单次聚合时最多附带的事件样本行数（防消息超长）
 LOG_ALERT_MAX_SAMPLES = _env_int("LOG_ALERT_MAX_SAMPLES", 5)
 
+# ============ 日志语义诊断规则（可配置化） ============
+# 结构：[{"code": 日志事件代码, "when": {指标: warning|critical}, "diagnosis": ..., "advice": ...}]
+# 当某日志代码命中，且 when 中列出的指标全部达到对应水位时，给出语义化根因诊断与建议。
+# 默认内置 Nginx 网关过载 / Docker OOM 两条；可用 MONITOR_DIAGNOSTICS 环境变量
+# 以 JSON 数组整体覆盖（与 services/log_jobs 的注入方式一致）。
+_DEFAULT_DIAGNOSTICS: list[dict] = [
+    {
+        "code": "NGINX_UPSTREAM_FAIL",
+        "when": {"cpu_percent": "warning", "memory_percent": "warning"},
+        "diagnosis": "Nginx 网关 5xx 与 CPU/内存水位双高，后端服务大概率过载或挂起，建议立即排查后端健康。",
+        "advice": "检查后端进程：systemctl status <backend>；查看日志：journalctl -u <backend> -n 100；"
+                  "关注连接数 ulimit 限制。",
+    },
+    {
+        "code": "DOCKER_OOM_KILL",
+        "when": {"memory_percent": "critical"},
+        "diagnosis": "检测到容器 OOMKilled 且主机内存达到 Critical 水位，存在资源争抢，建议调整容器内存限额。",
+        "advice": "查看限额：docker stats --no-stream；重新调度容器并设置 --memory / --memory-reservation。",
+    },
+]
+
+_env_diagnostics = _load_json_env("MONITOR_DIAGNOSTICS")
+DIAGNOSTICS = _env_diagnostics if _env_diagnostics is not None else _DEFAULT_DIAGNOSTICS
+
 
 def validate() -> list[tuple[str, str]]:
     """配置体检，返回 [(level, message)]；level 为 fatal 或 warning。"""
@@ -192,6 +224,8 @@ def validate() -> list[tuple[str, str]]:
 
     if COLLECT_INTERVAL <= 0 or LOG_SCAN_INTERVAL <= 0:
         problems.append(("fatal", "MONITOR_INTERVAL / LOG_SCAN_INTERVAL 必须为正整数"))
+    if COLLECT_WORKERS <= 0:
+        problems.append(("fatal", "MONITOR_COLLECT_WORKERS 必须为正整数"))
     if ALERT_COOLDOWN < 0:
         problems.append(("fatal", "ALERT_COOLDOWN 不能为负数"))
     if PUSH_MAX_RETRIES < 0 or PUSH_TIMEOUT <= 0 or PUSH_RETRY_BACKOFF <= 0:
@@ -228,10 +262,27 @@ def validate() -> list[tuple[str, str]]:
             import re
             for pattern, code, desc in job["patterns"]:
                 if not code or not desc:
-                    problems.append(("fatal", f"日志任务 {job.get('name')} 的 pattern 必须为 (正则, 代码, 描述) 三元组"))
+                    problems.append(
+                        ("fatal", f"日志任务 {job.get('name')} 的 pattern 必须为 (正则, 代码, 描述) 三元组")
+                    )
                 try:
                     re.compile(pattern)
                 except re.error as exc:
                     problems.append(("fatal", f"日志任务 {job.get('name')} 正则非法: {exc}"))
+
+    if not isinstance(DIAGNOSTICS, list):
+        problems.append(("fatal", "MONITOR_DIAGNOSTICS 必须是 JSON 数组"))
+    else:
+        for rule in DIAGNOSTICS:
+            if (not isinstance(rule, dict)
+                    or not rule.get("code")
+                    or not isinstance(rule.get("when"), dict)
+                    or not rule.get("diagnosis")
+                    or not rule.get("advice")):
+                problems.append(("fatal", f"诊断规则配置不合法（需 code/when/diagnosis/advice）: {rule}"))
+                continue
+            for metric, level in rule["when"].items():
+                if metric not in THRESHOLDS or level not in ("warning", "critical"):
+                    problems.append(("fatal", f"诊断规则 {rule.get('code')} 引用了未知指标/级别: {metric}:{level}"))
 
     return problems

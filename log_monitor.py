@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 日志语义监控：轮询关键日志，实时匹配 Nginx 502/504、Docker OOMKilled 等。
 
@@ -22,8 +21,8 @@ import subprocess
 import time
 from pathlib import Path
 
-from config import COMMAND_SHELL, LOG_COMMAND_TIMEOUT, LOG_JOBS, THRESHOLDS
 from collectors import MetricSnapshot, _find_binary
+from config import COMMAND_SHELL, DIAGNOSTICS, LOG_COMMAND_TIMEOUT, LOG_JOBS, THRESHOLDS
 
 logger = logging.getLogger("monitor.logwatch")
 
@@ -101,7 +100,7 @@ class CommandLogWatcher:
             logger.info("日志命令不存在，跳过该任务（%s 未安装）: %s", first, command)
 
     def poll(self, hostname: str) -> list:
-        if self._missing:
+        if self._missing or self._shell is None:
             return []
         try:
             out = subprocess.run(
@@ -146,30 +145,15 @@ def _resolve_shell() -> str | None:
 class LogSemanticEngine:
     """日志语义诊断引擎：日志命中 + 系统指标联动分析。"""
 
-    # 语义化诊断规则：命中某日志代码，且满足全部资源条件 -> 输出诊断与建议。
-    # when 的值引用 THRESHOLDS 中的级别（warning / critical），统一阈值来源。
-    DIAGNOSTICS = [
-        {
-            "code": "NGINX_UPSTREAM_FAIL",
-            "when": {"cpu_percent": "warning", "memory_percent": "warning"},
-            "diagnosis": "Nginx 网关 5xx 与 CPU/内存水位双高，后端服务大概率过载或挂起，建议立即排查后端健康。",
-            "advice": "检查后端进程：systemctl status <backend>；查看日志：journalctl -u <backend> -n 100；"
-                      "关注连接数 ulimit 限制。",
-        },
-        {
-            "code": "DOCKER_OOM_KILL",
-            "when": {"memory_percent": "critical"},
-            "diagnosis": "检测到容器 OOMKilled 且主机内存达到 Critical 水位，存在资源争抢，建议调整容器内存限额。",
-            "advice": "查看限额：docker stats --no-stream；重新调度容器并设置 --memory / --memory-reservation。",
-        },
-    ]
+    # 语义化诊断规则定义在 config.DIAGNOSTICS（默认内置两条，可用 MONITOR_DIAGNOSTICS 覆盖）；
+    # 命中某日志代码且 when 中全部资源条件满足时输出诊断与建议，阈值统一引用 config.THRESHOLDS。
 
     def __init__(self, hostname: str):
         self.hostname = hostname
         self.watchers = self._build_watchers()
 
     def _build_watchers(self) -> list:
-        watchers = []
+        watchers: list = []
         for job in LOG_JOBS:
             try:
                 if "path" in job:
@@ -198,7 +182,7 @@ class LogSemanticEngine:
         base["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
         diag = None
         if snapshot is not None:
-            for rule in self.DIAGNOSTICS:
+            for rule in DIAGNOSTICS:
                 if rule["code"] == ev.code and self._match_diag(rule, snapshot):
                     diag = rule
                     break

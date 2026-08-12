@@ -47,6 +47,9 @@ monitor-agent 是一套**单进程常驻**的监控告警中间件，适合部�
 - **SKIP 自动跳过**：配置了但主机未安装的服务自动判 SKIP，不误报 DOWN；
 - **SKIP 一次性通知**：首次启动时向钉钉汇总通知“哪些服务未安装已跳过”，
   标记持久化，开机重启不重复轰炸；
+- **开机启动播报**：进程启动后首次采集完成即推送一次状态播报：当前系统指标 +
+  服务 UP/DOWN/SKIP 明细（含“哪些已跳过、哪些异常”），启用时自动覆盖 SKIP 通知
+  （`STARTUP_NOTIFY` 开关）；
 - **恢复通知**：指标回落、服务 DOWN->UP、日志事件停止出现时发送“已恢复”；
   推送成功后才落盘状态，失败不丢失、下轮重试；
 - **状态持久化**：冷却、告警级别、服务状态落盘（`alert-state.json`），
@@ -74,7 +77,11 @@ monitor-agent/
 ├── alerting.py                 # 阈值判定、冷却、钉钉推送、留痕、SKIP 通知
 ├── log_monitor.py              # 日志语义监控（文件型 / 命令型）
 ├── config.example.json         # 服务与日志监控配置示例（nginx + docker）
-├── requirements.txt            # Python 依赖（psutil）
+├── requirements.txt            # 生产依赖（psutil）
+├── requirements-dev.txt        # 开发/测试/CI 依赖（pytest / ruff / mypy）
+├── pyproject.toml              # pytest / ruff / mypy 配置
+├── tests/                      # 核心逻辑单测（StateStore/Cooldown/AlertEngine/匹配逻辑）
+├── .github/workflows/ci.yml    # CI：ruff lint + mypy + pytest（3.8–3.12）
 ├── README.md                   # 快速上手
 ├── DOCUMENTATION.md            # 本文档
 ├── deploy/
@@ -418,7 +425,9 @@ Windows 等没有 POSIX shell 的环境下，命令型任务自动跳过，文�
 
 **联动诊断**：命中 `NGINX_UPSTREAM_FAIL` 且 CPU、内存同时达到 Warning 水位，
 判定“后端过载”；命中 `DOCKER_OOM_KILL` 且内存达到 Critical 水位，判定“资源争抢”。
-条件全部满足才算命中，单高不误诊；诊断规则集中在 `log_monitor.DIAGNOSTICS`，
+条件全部满足才算命中，单高不误诊。诊断规则定义在 `config.DIAGNOSTICS`
+（默认内置上述两条），可用 `MONITOR_DIAGNOSTICS` 环境变量以 JSON 数组整体覆盖，
+结构为 `[{"code", "when": {指标: warning|critical}, "diagnosis", "advice"}]`；
 阈值统一引用 `config.THRESHOLDS`。
 
 ### 6.5 告警消息格式
@@ -455,6 +464,39 @@ Windows 等没有 POSIX shell 的环境下，命令型任务自动跳过，文�
 所有告警（含推送失败、未配置 Webhook）都会写入 `alerts.jsonl`，每行一条结构化 JSON；
 超过 `ALERT_HISTORY_MAX_BYTES`（默认 10MB）自动轮转为 `.1` / `.2`。
 
+### 6.7 开机启动播报（启动状态总览）
+
+进程每次启动、首次采集完成后，自动向钉钉推送一次 **Info 级状态播报**，内容包含：
+
+- **系统指标**：CPU / 内存 / 磁盘 / 负载 / 温度当前值；
+- **服务状态明细**：逐个列出 UP / DOWN / SKIP，DOWN 附带探测诊断、SKIP 标注“未安装已跳过”；
+- **汇总行**：`UP N 个 / DOWN M 个 / SKIP K 个`，一眼掌握哪些服务异常、哪些被跳过。
+
+```text
+### [Info] 告警 - startup:report
+主机：host-a
+时间：2026-08-13 09:00:00
+指标：startup:report（单位 -）
+当前值：
+**系统指标**：CPU 12.3% | 内存 45.0% | 磁盘 18.2% | 负载 0.12 | 温度 44.0℃
+**服务状态**：
+- docker：UP
+- nginx：**DOWN**（进程=不在;tcp=不通）
+- sshd：SKIP（未检测到安装痕迹，已自动跳过）
+**汇总**：UP 1 个 / DOWN 1 个 / SKIP 1 个
+建议措施：
+> 本消息为开机启动播报，展示当前系统指标与服务状态。…
+```
+
+行为细节：
+
+- 每次进程启动发送一次（systemd 开机拉起 / 手动 restart 均会播报）；
+- 播报天然包含 SKIP 信息，因此**启用时自动标记 SKIP 已通知**，不会与
+  6.3 的 SKIP 一次性通知重复发送；关闭播报（`STARTUP_NOTIFY=0`）则回退为
+  仅发送 SKIP 一次性通知；
+- 配置了 Webhook 但推送失败：本进程内不重试（留痕已写入），下次进程启动再发；
+- 不配置 Webhook 时仅本地留痕，不推送。
+
 ---
 
 ## 7. 配置参考
@@ -468,9 +510,11 @@ Windows 等没有 POSIX shell 的环境下，命令型任务自动跳过，文�
 | `MONITOR_CONFIG_FILE` | 空 | JSON 配置文件路径（services / log_jobs） |
 | `MONITOR_SERVICES` | 空 | 服务清单 JSON 数组（文件配置优先） |
 | `MONITOR_LOG_JOBS` | 空 | 日志任务 JSON 数组（文件配置优先） |
+| `MONITOR_DIAGNOSTICS` | 内置两条 | 日志语义诊断规则 JSON 数组（默认含 Nginx 网关过载 / Docker OOM） |
 | `MONITOR_INTERVAL` | 60 | 指标采集周期（秒） |
 | `LOG_SCAN_INTERVAL` | 10 | 日志轮询周期（秒） |
 | `ALERT_COOLDOWN` | 300 | 同类型告警冷却（秒） |
+| `MONITOR_COLLECT_WORKERS` | 4 | 指标采集线程池 worker 数（高峰期排队可调大） |
 | `PUSH_TIMEOUT` | 5 | 单次 HTTP 推送超时（秒） |
 | `PUSH_MAX_RETRIES` | 3 | 推送失败后的重试次数（退避序列 `2s→4s→8s`） |
 | `PUSH_RETRY_BACKOFF` | 2.0 | 首次退避基数（秒），第 n 次重试等待 `基数 × 2ⁿ⁻¹` |
@@ -487,6 +531,7 @@ Windows 等没有 POSIX shell 的环境下，命令型任务自动跳过，文�
 | `PID_FILE` | 状态目录/`monitor-agent.pid` | 单实例锁 |
 | `SKIP_NOTIFY_FILE` | 状态目录/`skip-notified.json` | SKIP 一次性通知标记 |
 | `SKIP_NOTIFY_ONCE` | 1 | 是否启用 SKIP 首次通知（`0`/`false`/`no` 关闭） |
+| `STARTUP_NOTIFY` | 1 | 是否发送开机启动播报（`0`/`false`/`no` 关闭，回退为仅 SKIP 通知） |
 | `MONITOR_LOG_FILE` | 状态目录/`monitor-agent.log` | 运行日志文件（设空串则仅 stdout，供 journald；systemd 下为 `/var/log/monitor-agent/monitor-agent.log`） |
 | `MONITOR_LOG_MAX_BYTES` | 5242880 | 运行日志轮转阈值（字节） |
 | `MONITOR_LOG_BACKUPS` | 2 | 运行日志备份数 |
@@ -557,20 +602,41 @@ sudo systemctl restart monitor-agent
 
 ### 9.3 升级
 
+任意旧版本 → 最新，三步完成：
+
 ```bash
-cd Simple-alarm-script
-git pull
-sudo bash install.sh systemd
+cd Simple-alarm-script          # 或你之前 clone 的目录
+git pull                        # 若本地改过文件，先 git stash 或提交，避免冲突
+sudo bash install.sh systemd    # 覆盖安装 + 重建服务单元并立即重启
 ```
 
-升级会先备份目标目录（`/opt/monitor-agent.bak-<时间戳>`）再覆盖；systemd 服务已注册时
-可直接重启生效。回滚：
+升级脚本自动完成：
+
+1. 备份旧程序到 `/opt/monitor-agent.bak-<时间戳>`（zip 归档的旧包也会留备份）；
+2. 覆盖核心代码、README/DOCUMENTATION、配置示例与 systemd 模板；
+3. 自动探测本机 `python3` 路径写入服务单元（不再写死 `/usr/bin/python3`）；
+4. 检测 systemd 版本：< 235（如 CentOS 7）自动改用 legacy 兼容模板；
+5. `systemctl daemon-reload` + `enable --now` 重启生效。
+
+兼容性说明：
+
+- `/etc/monitor-agent/env` 与已存在的配置示例不会被覆盖，密钥、服务清单、阈值原样保留；
+- 新增环境变量全部可选（见 7.1 环境变量总表），旧配置无需改动即可运行；
+- 行为变化：`STARTUP_NOTIFY` 默认开启，升级后每次启动会推送“开机状态播报”
+  （系统指标 + UP/DOWN/SKIP 明细）；不需要请设 `STARTUP_NOTIFY=0`；
+- 进程名匹配从“子串包含”改为“精确/通配符匹配”，若服务清单里使用前缀式进程名，
+  请显式改成通配符（如 `java*`），否则可能误报 DOWN；
+- 诊断规则默认内置 Nginx 网关过载 / Docker OOM 两条，可用 `MONITOR_DIAGNOSTICS` 整体覆盖。
+
+回滚：
 
 ```bash
 sudo rm -rf /opt/monitor-agent
 sudo mv /opt/monitor-agent.bak-<时间戳> /opt/monitor-agent
 sudo systemctl restart monitor-agent
 ```
+
+完整变更历史见仓库根目录 `CHANGELOG.md`。
 
 ### 9.4 卸载
 

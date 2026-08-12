@@ -53,6 +53,37 @@ sudo MONITOR_AGENT_DIR=/usr/local/monitor-agent bash install.sh systemd
 systemd 服务以 `User=root` 运行；取消自启用 `sudo bash install.sh systemd-remove`，
 完全卸载用 `sudo bash install.sh uninstall`。
 
+## 老用户升级（旧版 → 最新）
+
+已经装过旧版（含早期 install.sh 部署到 `/opt/monitor-agent`）的，三步即可更新：
+
+```bash
+cd Simple-alarm-script        # 之前 clone 的目录
+git pull
+sudo bash install.sh systemd  # 覆盖安装 + 重建服务单元并重启
+```
+
+升级是安全的，可以随时回滚：
+
+- 旧代码自动备份到 `/opt/monitor-agent.bak-<时间戳>`，先装新文件再重启，不会出现“装一半”；
+- `/etc/monitor-agent/env` 与已存在的配置示例**不会被覆盖**，钉钉密钥、服务清单、阈值原样保留；
+- 服务单元会按当前机器实际的 `python3` 路径重建（不再写死 `/usr/bin/python3`），
+  旧版 systemd（< 235，如 CentOS 7）自动改用兼容模板；
+- 本次升级新增“开机状态播报”（`STARTUP_NOTIFY`，默认开启）：每次启动会推送一条
+  系统指标 + 服务 UP/DOWN/SKIP 汇总。不需要可设 `STARTUP_NOTIFY=0`；
+- 进程名匹配改为“精确/通配符”（不再子串包含），清单里若用了 `nginx` 这类前缀匹配，
+  请显式写成 `nginx` 或 `nginx*`，避免误报。
+
+回滚：
+
+```bash
+sudo rm -rf /opt/monitor-agent
+sudo mv /opt/monitor-agent.bak-<时间戳> /opt/monitor-agent
+sudo systemctl restart monitor-agent
+```
+
+完整变更见同目录 `CHANGELOG.md`，更多运维细节见 `DOCUMENTATION.md`。
+
 ## 按主机配置服务与日志监控
 
 生产可移植原则：**默认不假设任何业务**，因此开箱即用时只监控系统指标
@@ -105,11 +136,13 @@ JSON 数组：`MONITOR_SERVICES` / `MONITOR_LOG_JOBS`。
 | `MONITOR_CONFIG_FILE` | 空 | JSON 配置文件路径（services / log_jobs） |
 | `MONITOR_SERVICES` | 空 | 服务清单 JSON 数组（文件配置优先） |
 | `MONITOR_LOG_JOBS` | 空 | 日志任务 JSON 数组（文件配置优先） |
+| `MONITOR_DIAGNOSTICS` | 内置两条 | 日志语义诊断规则 JSON 数组（默认含 Nginx 网关过载 / Docker OOM） |
 | `DINGTALK_WEBHOOK` | 空 | 钉钉机器人 Webhook，空则仅本地留痕 |
 | `DINGTALK_SECRET` | 空 | 钉钉加签密钥 |
 | `MONITOR_INTERVAL` | 60 | 指标采集周期（秒） |
 | `LOG_SCAN_INTERVAL` | 10 | 日志轮询周期（秒） |
 | `ALERT_COOLDOWN` | 300 | 同类型告警冷却（秒） |
+| `MONITOR_COLLECT_WORKERS` | 4 | 指标采集线程池 worker 数 |
 | `PUSH_TIMEOUT` | 5 | 单次 HTTP 推送超时（秒） |
 | `PUSH_MAX_RETRIES` | 3 | 推送失败重试次数（指数退避） |
 | `PUSH_RETRY_BACKOFF` | 2.0 | 首次退避基数（秒） |
@@ -126,6 +159,7 @@ JSON 数组：`MONITOR_SERVICES` / `MONITOR_LOG_JOBS`。
 | `PID_FILE` | 状态目录/`monitor-agent.pid` | 单实例锁 |
 | `SKIP_NOTIFY_FILE` | 状态目录/`skip-notified.json` | SKIP 一次性通知标记 |
 | `SKIP_NOTIFY_ONCE` | 1 | 是否启用 SKIP 首次通知（0 关闭） |
+| `STARTUP_NOTIFY` | 1 | 是否发送开机状态播报（0 关闭，回退为仅 SKIP 通知） |
 | `MONITOR_LOG_FILE` | 状态目录/`monitor-agent.log` | 运行日志文件（设空串则仅 stdout，供 journald） |
 | `MONITOR_LOG_MAX_BYTES` | 5242880 | 运行日志轮转阈值（字节） |
 | `MONITOR_LOG_BACKUPS` | 2 | 运行日志备份数 |
@@ -137,6 +171,8 @@ JSON 数组：`MONITOR_SERVICES` / `MONITOR_LOG_JOBS`。
 
 - 进程启动后创建 asyncio 事件循环，并行运行 `metrics_loop`（指标 + 服务存活）
   与 `logwatch_loop`（日志语义）两个协程；
+- 首次采集完成后发送一次**开机状态播报**：当前系统指标 + 服务 UP/DOWN/SKIP 明细
+  （含“哪些服务已跳过、哪些异常”），启用时自动覆盖 SKIP 一次性通知；
 - 指标采集的阻塞 IO（1 秒 CPU 采样、socket 探测、子进程命令）全部提交到
   应用自有线程池执行，不阻塞事件循环；
 - 钉钉推送（含退避重试）同样在独立线程中执行，网络抖动不会卡住事件循环；

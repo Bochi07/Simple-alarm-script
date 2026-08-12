@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 指标采集模块：psutil 与 /proc 文件系统双通道。
 
@@ -13,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import logging
 import os
 import shutil
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import psutil
 
-from config import SERVICES
+from config import COLLECT_WORKERS, SERVICES
 
 logger = logging.getLogger("monitor.collect")
 
@@ -35,7 +35,7 @@ THERMAL_ZONE_DIR = Path("/sys/class/thermal")
 
 # 应用自有采集线程池：阻塞采集全部在此执行，不阻塞事件循环；
 # 由 main 在退出时主动有界收尾（避免依赖 asyncio 默认线程池的 300s 等待）。
-EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="monitor-agent")
+EXECUTOR = ThreadPoolExecutor(max_workers=COLLECT_WORKERS, thread_name_prefix="monitor-agent")
 
 
 async def await_executor_future(fut):
@@ -197,18 +197,35 @@ def get_temperature() -> float:
 
 
 # ================= 服务存活性 =================
+def _name_matches(wanted: list, name: str) -> bool:
+    """进程名 / 可执行名匹配：含通配符时用 fnmatch，否则精确匹配。
+
+    精确匹配避免 "nginx" 误匹配 "nginx-foo" 这类子串误报；
+    如确有前缀类进程名需求，可配置通配符，如 "java*" / "nginx: master?"。
+    """
+    lowered = name.lower()
+    for w in wanted:
+        wl = w.lower()
+        if any(ch in wl for ch in ("*", "?", "[")):
+            if fnmatch.fnmatchcase(lowered, wl):
+                return True
+        elif lowered == wl:
+            return True
+    return False
+
+
 def _process_alive(process_names: list) -> bool:
     """进程名 / argv[0] 匹配，避免对 cmdline 全字段做子串匹配造成误报。"""
     wanted = [n.lower() for n in process_names]
     for proc in psutil.process_iter(["name", "cmdline"]):
         try:
             pname = (proc.info["name"] or "").lower()
-            if any(w in pname for w in wanted):
+            if _name_matches(wanted, pname):
                 return True
             cmdline = proc.info["cmdline"] or []
             if cmdline:
                 argv0 = Path(cmdline[0]).name.lower()
-                if any(w in argv0 for w in wanted):
+                if _name_matches(wanted, argv0):
                     return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -252,7 +269,11 @@ def _tcp_listening(host: str, port: int) -> bool:
 
 
 def _unix_socket_available(path: str) -> bool:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    af_unix = getattr(socket, "AF_UNIX", None)
+    if af_unix is None:
+        # Windows 等无 AF_UNIX 平台：直接判不可用，交由服务状态逻辑处理
+        return False
+    sock = socket.socket(af_unix, socket.SOCK_STREAM)
     sock.settimeout(2)
     try:
         sock.connect(path)
@@ -275,9 +296,7 @@ def _service_present(svc: dict) -> bool:
             return True
     if svc.get("unix_socket") and Path(svc["unix_socket"]).exists():
         return True
-    if svc.get("port") and _port_has_listener(svc["port"]):
-        return True
-    return False
+    return bool(svc.get("port") and _port_has_listener(svc["port"]))
 
 
 def check_service(svc: dict) -> tuple:

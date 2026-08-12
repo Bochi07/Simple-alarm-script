@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 告警模块：分级阈值判定 + 钉钉 Webhook 推送结构化 JSON 告警。
 
@@ -25,6 +24,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from collectors import MetricSnapshot, await_executor_future
 from config import (
     ALERT_COOLDOWN,
     ALERT_HISTORY_BACKUPS,
@@ -39,7 +39,6 @@ from config import (
     SKIP_NOTIFY_ONCE,
     THRESHOLDS,
 )
-from collectors import MetricSnapshot, await_executor_future
 
 logger = logging.getLogger("monitor.alert")
 
@@ -334,6 +333,66 @@ async def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str
     pushed = await _push_in_executor(alert)
     if pushed or not DINGTALK_WEBHOOK:
         _mark_skip_notified(names)
+        return True
+    return False
+
+
+async def notify_startup_report(snapshot: MetricSnapshot) -> bool:
+    """进程启动后首次采集完成时，发送一次开机状态播报。
+
+    内容：当前系统指标 + 服务状态总览（UP / DOWN / SKIP 明细），
+    便于开机后一眼掌握主机健康与跳过/异常的服务。
+
+    - 播报天然包含 SKIP 信息，因此推送成功（或未配置 Webhook 已留痕）后
+      会标记 SKIP 已通知，避免与 notify_skipped_once 的独立通知重复发送；
+    - 配置了 Webhook 但推送失败：返回 False，本进程内不重试（留痕已写入，
+      下次进程启动会再发一次）。
+    """
+    services = snapshot.services or {}
+    up = [n for n, s in services.items() if s == "UP"]
+    down = [n for n, s in services.items() if s == "DOWN"]
+    skipped = [n for n, s in services.items() if s == "SKIP"]
+    err_detail = {e["service"]: e.get("detail", "") for e in snapshot.service_errors}
+
+    metric_line = (
+        f"CPU {snapshot.cpu_percent:.1f}% | 内存 {snapshot.memory_percent:.1f}% | "
+        f"磁盘 {snapshot.disk_percent:.1f}% | 负载 {snapshot.load1:.2f} | "
+        f"温度 {snapshot.temperature_c:.1f}℃"
+    )
+    lines = [f"**系统指标**：{metric_line}", "**服务状态**："]
+    if services:
+        for name in sorted(services):
+            status = services[name]
+            if status == "DOWN":
+                detail = err_detail.get(name, "")
+                lines.append(f"- {name}：**DOWN**（{detail or '探测异常'}）")
+            elif status == "SKIP":
+                lines.append(f"- {name}：SKIP（未检测到安装痕迹，已自动跳过）")
+            else:
+                lines.append(f"- {name}：UP")
+    else:
+        lines.append("- （未配置服务监控）")
+    lines.append(f"**汇总**：UP {len(up)} 个 / DOWN {len(down)} 个 / SKIP {len(skipped)} 个")
+
+    alert = {
+        "metric": "startup:report",
+        "hostname": snapshot.hostname,
+        "timestamp": snapshot.timestamp,
+        "value": "\n".join(lines),
+        "threshold": "-",
+        "level": "Info",
+        "unit": "-",
+        "advice": (
+            "本消息为开机启动播报，展示当前系统指标与服务状态。"
+            "DOWN 服务请及时处理；SKIP 服务为本机未安装，已自动跳过，不影响监控。"
+        ),
+    }
+    logger.warning("发送开机启动播报（UP=%d DOWN=%d SKIP=%d）", len(up), len(down), len(skipped))
+    pushed = await _push_in_executor(alert)
+    if pushed or not DINGTALK_WEBHOOK:
+        # 播报已覆盖 SKIP 信息：标记已通知，避免 SKIP 一次性通知重复发送
+        if SKIP_NOTIFY_ONCE and skipped:
+            _mark_skip_notified(skipped)
         return True
     return False
 

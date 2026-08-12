@@ -3,7 +3,11 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv*/
 venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 
 # 本地配置与密钥（绝不上传）
 .env
