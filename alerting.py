@@ -5,7 +5,7 @@
   - Warning / Critical 分级：命中阈值自动升级；
   - 连续判定防抖：指标/磁盘连续 N 次（默认 3，ALERT_CONSECUTIVE）异常才告警，
     连续 N 次正常才发恢复通知，避免单次毛刺误报；
-  - 内存含 swap：RAM 与 swap 使用率共同判定，任一超阈值即告警；
+  - 内存告警：仅按总内存（RAM）使用率判定，swap 仅作参考、不参与阈值；
   - 冷却去抖：同指标同级别在冷却期内只推送一次，避免告警风暴；冷却状态持久化，
     进程重启后继续生效，不因重启立刻重复告警；
   - 恢复通知：指标回落、服务 DOWN->UP/SKIP、日志事件停止出现时，发送“已恢复”通知；
@@ -58,8 +58,8 @@ _METRIC_FIELD = {
     "load1": "load1",
 }
 
-# 服务状态色点（钉钉消息中仅用这三个圆圈表示 UP / DOWN / SKIP）
-_STATUS_ICON = {"UP": "🟢", "DOWN": "🔴", "SKIP": "🟡"}
+# 服务状态文本徽标（消息中不用表情符号，仅用 [UP]/[DOWN]/[SKIP] 表示）
+_STATUS_BADGE = {"UP": "[UP]", "DOWN": "[DOWN]", "SKIP": "[SKIP]"}
 
 # 指标/消息友好名称（用于钉钉标题与字段展示）
 _DISPLAY_NAME = {
@@ -71,19 +71,6 @@ _DISPLAY_NAME = {
     "startup:report": "开机状态播报",
     "service:skip:first-run": "服务自动跳过通知",
 }
-
-# 告警级别严重度排序（用于 RAM/swap 取较高级别）
-_SEVERITY_RANK = {"Warning": 1, "Critical": 2}
-
-
-def _pick_level(a: str | None, b: str | None) -> str | None:
-    """取两个告警级别中较严重的一个；None 表示未超阈值。"""
-    if a is None:
-        return b
-    if b is None:
-        return a
-    return a if _SEVERITY_RANK[a] >= _SEVERITY_RANK[b] else b
-
 
 def _display_metric(metric: str) -> str:
     """把内部指标名转成消息里更易读的名称。"""
@@ -100,8 +87,8 @@ def _display_metric(metric: str) -> str:
 _OPS_ADVICE = {
     "cpu_percent": "排查高占用进程：ps -eo pid,user,%cpu,comm --sort=-%cpu | head -20；"
                    "如为业务异常请重启相关服务。",
-    "memory_percent": "检查内存与 swap 占用：free -h；定位大内存进程：top -o %MEM；"
-                      "swap 已大量占用说明内存持续吃紧，建议排查进程并优化内存使用或扩容；"
+    "memory_percent": "检查内存占用：free -h；定位大内存进程：top -o %MEM；"
+                      "内存持续高位建议排查进程并优化内存使用或扩容；"
                       "如为缓存膨胀可等待内核自动回收。",
     "disk_percent": "清理日志：find /var/log -type f -name '*.log' -size +100M -delete；"
                     "定位大目录：du -sh /var/log/* | sort -rh | head -20。",
@@ -285,9 +272,9 @@ def _sign(url: str, secret: str) -> str:
 def _render_alert(alert: dict) -> tuple[str, str]:
     """渲染告警的 (标题, 正文)，所有通知渠道共用。
 
-    正文左对齐、字段加粗、状态仅用色点圆圈（🟢/🔴/🟡）；告警 dict 可携带可选字段
-    body（已排版好的复合内容，如开机播报/SKIP 明细/日志样本），没有 body 时按
-    指标/当前值/触发阈值 标准字段渲染。
+    正文左对齐、字段加粗，级别使用【】徽标，状态使用 [UP]/[DOWN]/[SKIP] 文本徽标，
+    全程不使用表情符号；告警 dict 可携带可选字段 body（已排版好的复合内容，如开机
+    播报/SKIP 明细/日志样本），没有 body 时按指标/当前值/触发阈值标准字段渲染。
     """
     label = _display_metric(alert["metric"])
     if alert["level"] == "Recovery":
@@ -295,10 +282,11 @@ def _render_alert(alert: dict) -> tuple[str, str]:
         heading = f"## 恢复 - {label}"
     else:
         title = f"[{alert['level']}] 告警 - {label}"
-        heading = f"## 告警 - {label}（{alert['level']}）"
+        heading = f"## 告警 - {label}"
 
     lines = [
         heading, "",
+        f"**级别**：【{alert['level']}】",
         f"**主机**：{alert['hostname']}",
         f"**时间**：{_display_time(alert['timestamp'])}",
     ]
@@ -415,7 +403,7 @@ async def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str
         return False
 
     body = "\n".join(
-        f"- {s.get('name', '?')}：🟡 {s.get('detail', '未检测到安装痕迹，已自动跳过')}"
+        f"- {s.get('name', '?')}：[SKIP] {s.get('detail', '未检测到安装痕迹，已自动跳过')}"
         for s in skipped
     )
     alert = {
@@ -444,8 +432,8 @@ async def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str
 def _build_startup_report(snapshot: MetricSnapshot) -> tuple[str, str]:
     """组装开机播报的 (value, body)：value 为一行摘要，body 为钉钉正文。
 
-    正文左对齐，服务状态仅用色点圆圈（🟢/🔴/🟡）表示，段落间用空行分隔，
-    避免钉钉 markdown 把单换行渲染成空格粘连。
+    正文左对齐、每项一行，服务状态使用 [UP]/[DOWN]/[SKIP] 文本徽标，
+    不使用表情符号；段落间用空行分隔，避免钉钉 markdown 把单换行渲染成空格粘连。
     """
     services = snapshot.services or {}
     up = [n for n, s in services.items() if s == "UP"]
@@ -462,35 +450,42 @@ def _build_startup_report(snapshot: MetricSnapshot) -> tuple[str, str]:
     if temp_src and temp_src != "none":
         temp_part += f"（{temp_src}）"
 
-    body_lines = ["**系统指标**", ""]
-    body_lines.append(
-        f"- CPU：{snapshot.cpu_percent:.1f}% ｜ 内存：{snapshot.memory_percent:.1f}%"
-        f"（swap {snapshot.swap_percent:.1f}%）｜ "
-        f"磁盘：{disk_part}"
+    mem_line = (
+        f"- 内存：{snapshot.memory_percent:.1f}%"
+        f"（已用 {snapshot.memory_used_gb:.1f} / {snapshot.memory_total_gb:.1f} GB"
     )
+    if snapshot.swap_total_gb > 0:
+        mem_line += f"，swap {snapshot.swap_percent:.1f}%"
+    mem_line += "）"
+
+    body_lines = ["**系统指标**", ""]
+    body_lines.append(f"- CPU：{snapshot.cpu_percent:.1f}%")
+    body_lines.append(mem_line)
+    body_lines.append(f"- 磁盘：{disk_part}")
     body_lines.append(f"- 负载：{snapshot.load1:.2f} ｜ 温度：{temp_part}")
     body_lines += ["", "**服务状态**"]
     if services:
         for name in sorted(services):
             status = services[name]
-            mark = _STATUS_ICON.get(status, "•")
+            badge = _STATUS_BADGE.get(status, status)
             if status == "DOWN":
                 detail = err_detail.get(name, "")
-                body_lines.append(f"- {name}：{mark} DOWN（{detail or '探测异常'}）")
+                body_lines.append(f"- {name}：{badge}（{detail or '探测异常'}）")
             elif status == "SKIP":
-                body_lines.append(f"- {name}：{mark} SKIP（未检测到安装痕迹，已自动跳过）")
+                body_lines.append(f"- {name}：{badge}（未检测到安装痕迹，已自动跳过）")
             else:
-                body_lines.append(f"- {name}：{mark} UP")
+                body_lines.append(f"- {name}：{badge}")
     else:
         body_lines.append("- （未配置服务监控）")
     body_lines += [
         "",
-        f"**汇总**：🟢 UP {len(up)} ｜ 🔴 DOWN {len(down)} ｜ 🟡 SKIP {len(skipped)}"
+        f"**汇总**：UP {len(up)} ｜ DOWN {len(down)} ｜ SKIP {len(skipped)}",
     ]
 
     value = (
         f"CPU {snapshot.cpu_percent:.1f}% / 内存 {snapshot.memory_percent:.1f}%"
-        f"（swap {snapshot.swap_percent:.1f}%）/ "
+        f"（已用 {snapshot.memory_used_gb:.1f} / {snapshot.memory_total_gb:.1f} GB）"
+        f" / "
         f"磁盘 {disk_part} / 负载 {snapshot.load1:.2f} / 温度 {temp_part}"
     )
     return value, "\n".join(body_lines)
@@ -711,16 +706,20 @@ class AlertEngine:
                 cores = max(os.cpu_count() or 1, 1)
                 norm = value / cores
                 value_text = f"{norm:.2f}x核（原始负载 {value:.2f}）"
-                threshold_text = f"Warning:{rule['warning']}x核 / Critical:{rule['critical']}x核"
+                threshold_text = f"Warning {rule['warning']}x核 / Critical {rule['critical']}x核"
             elif metric == "memory_percent":
-                # 有 swap 的机器：RAM 与 swap 使用率共同判定，任一超阈值即告警，
-                # 避免“RAM 不高但 swap 已打满”的内存压力漏报。
-                level = _pick_level(level, _level_for("memory_percent", snapshot.swap_percent))
-                value_text = f"内存 {snapshot.memory_percent:.1f}% ｜ swap {snapshot.swap_percent:.1f}%"
-                threshold_text = f"Warning:{rule['warning']}{rule['unit']} / Critical:{rule['critical']}{rule['unit']}"
+                # 仅以总内存（RAM）使用率判定告警；swap 仅作参考展示，不参与阈值判定，
+                # 避免“RAM 不高但 swap 已打满”触发无谓告警。
+                value_text = (
+                    f"内存 {snapshot.memory_percent:.1f}%"
+                    f"（已用 {snapshot.memory_used_gb:.1f} / {snapshot.memory_total_gb:.1f} GB）"
+                )
+                threshold_text = (
+                    f"Warning {rule['warning']}{rule['unit']} / Critical {rule['critical']}{rule['unit']}"
+                )
             else:
                 value_text = f"{value:.1f}{rule['unit']}"
-                threshold_text = f"Warning:{rule['warning']}{rule['unit']} / Critical:{rule['critical']}{rule['unit']}"
+                threshold_text = f"Warning {rule['warning']}{rule['unit']} / Critical {rule['critical']}{rule['unit']}"
             prev = self._last_levels.get(metric)
             if level:
                 # 连续 N 次异常才真正告警（含 Warning->Critical 升级与降级）；
@@ -745,7 +744,7 @@ class AlertEngine:
                     "metric": metric,
                     "hostname": snapshot.hostname,
                     "timestamp": snapshot.timestamp,
-                    "value": f"{value_text}（已回落至正常范围）",
+                    "value": f"{value_text}，已回落至正常范围",
                     "threshold": threshold_text,
                     "level": "Recovery",
                     "unit": rule["unit"],
@@ -777,7 +776,7 @@ class AlertEngine:
                     "hostname": snapshot.hostname,
                     "timestamp": snapshot.timestamp,
                     "value": f"{pct:.1f}%（挂载点 {path}）",
-                    "threshold": f"Warning:{rule['warning']}% / Critical:{rule['critical']}%",
+                    "threshold": f"Warning {rule['warning']}% / Critical {rule['critical']}%",
                     "level": level,
                     "unit": "%",
                     "advice": _OPS_ADVICE["disk_percent"],
@@ -790,8 +789,8 @@ class AlertEngine:
                     "metric": metric,
                     "hostname": snapshot.hostname,
                     "timestamp": snapshot.timestamp,
-                    "value": f"{pct:.1f}%（挂载点 {path}，已回落至正常范围）",
-                    "threshold": f"Warning:{rule['warning']}% / Critical:{rule['critical']}%",
+                    "value": f"{pct:.1f}%（挂载点 {path}），已回落至正常范围",
+                    "threshold": f"Warning {rule['warning']}% / Critical {rule['critical']}%",
                     "level": "Recovery",
                     "unit": "%",
                     "advice": "磁盘占用已回落至阈值以下，恢复正常。请确认清理效果。",
@@ -814,7 +813,7 @@ class AlertEngine:
                 "metric": f"service:{err['service']}",
                 "hostname": snapshot.hostname,
                 "timestamp": snapshot.timestamp,
-                "value": "🔴 DOWN",
+                "value": "[DOWN]",
                 "threshold": "期望 UP",
                 "level": "Critical",
                 "unit": "-",
@@ -833,7 +832,7 @@ class AlertEngine:
                     "metric": f"service:{name}",
                     "hostname": snapshot.hostname,
                     "timestamp": snapshot.timestamp,
-                    "value": f"{_STATUS_ICON.get(status, '')} {status}",
+                    "value": _STATUS_BADGE.get(status, status),
                     "threshold": "期望 UP",
                     "level": "Recovery",
                     "unit": "-",

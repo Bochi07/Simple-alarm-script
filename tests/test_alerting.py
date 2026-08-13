@@ -7,7 +7,16 @@ from __future__ import annotations
 import json
 from unittest import mock
 
-from alerting import AlertEngine, Cooldown, StateStore, _compute_sign, _silence_active, _sign
+from alerting import (
+    AlertEngine,
+    Cooldown,
+    StateStore,
+    _build_startup_report,
+    _compute_sign,
+    _render_alert,
+    _sign,
+    _silence_active,
+)
 from collectors import MetricSnapshot
 
 
@@ -175,22 +184,27 @@ class TestAlertEngine:
         assert load and load[0]["level"] == "Warning"
         # value 与 threshold 尺度一致：value 标注归一化值 + 原始值，threshold 为每核阈值
         assert load[0]["value"] == "1.12x核（原始负载 9.00）"
-        assert load[0]["threshold"] == "Warning:1.0x核 / Critical:2.0x核"
+        assert load[0]["threshold"] == "Warning 1.0x核 / Critical 2.0x核"
 
-    def test_memory_swap_counts_toward_alert(self):
-        """RAM 不高但 swap 已打满时必须告警，且消息同时展示 RAM 与 swap。"""
+    def test_memory_alert_ignores_swap(self):
+        """swap 打满但总内存不高：不告警；总内存超阈值才告警，消息只体现 RAM。"""
         engine = AlertEngine()
         snap = make_snapshot(memory_percent=30.0, swap_percent=100.0)
         assert engine.evaluate(snap) == []
         assert engine.evaluate(snap) == []
-        alerts = engine.evaluate(snap)
-        mem = [a for a in alerts if a["metric"] == "memory_percent"]
-        assert mem and mem[0]["level"] == "Critical"
-        assert "swap 100.0%" in mem[0]["value"]
-        assert "内存 30.0%" in mem[0]["value"]
+        assert engine.evaluate(snap) == []
 
-        # swap 回落后，连续 3 次正常才恢复
-        snap2 = make_snapshot(memory_percent=30.0, swap_percent=1.0)
+        snap_high = make_snapshot(memory_percent=85.0, swap_percent=100.0)
+        assert engine.evaluate(snap_high) == []
+        assert engine.evaluate(snap_high) == []
+        alerts = engine.evaluate(snap_high)
+        mem = [a for a in alerts if a["metric"] == "memory_percent"]
+        assert mem and mem[0]["level"] == "Warning"
+        assert "内存 85.0%" in mem[0]["value"]
+        assert "swap" not in mem[0]["value"]
+
+        # 总内存回落后，连续 3 次正常才恢复
+        snap2 = make_snapshot(memory_percent=50.0, swap_percent=100.0)
         assert engine.evaluate(snap2) == []
         assert engine.evaluate(snap2) == []
         rec = [a for a in engine.evaluate(snap2) if a["metric"] == "memory_percent"]
@@ -217,6 +231,54 @@ class TestAlertEngine:
         assert engine.evaluate(make_snapshot(cpu_percent=90.0)) == []
         alerts = engine.evaluate(make_snapshot(cpu_percent=90.0))
         assert [a["metric"] for a in alerts] == ["cpu_percent"]
+
+
+class TestMessageRender:
+    def test_alert_render_structure_without_emoji(self):
+        alert = {
+            "metric": "memory_percent",
+            "hostname": "host-1",
+            "timestamp": "2026-08-13T00:00:00+00:00",
+            "value": "内存 85.0%（已用 1.0 / 4.0 GB）",
+            "threshold": "Warning 80.0% / Critical 92.0%",
+            "level": "Warning",
+            "unit": "%",
+            "advice": "检查内存占用：free -h",
+            "diagnosis": "内存水位偏高",
+        }
+        title, text = _render_alert(alert)
+        assert title == "[Warning] 告警 - 内存使用率"
+        assert "**级别**：【Warning】" in text
+        assert "**主机**：host-1" in text
+        assert "**时间**：" in text
+        assert "**指标**：内存使用率（单位 %）" in text
+        assert "**当前值**：内存 85.0%（已用 1.0 / 4.0 GB）" in text
+        assert "**触发阈值**：Warning 80.0% / Critical 92.0%" in text
+        assert "**根因诊断**：内存水位偏高" in text
+        assert "**建议措施**" in text
+        for emoji in "🟢🔴🟡⚠✅❌":
+            assert emoji not in text
+
+    def test_startup_report_uses_text_badges_without_emoji(self):
+        snap = make_snapshot(
+            services={"nginx": "UP", "redis": "DOWN", "app": "SKIP"},
+            service_errors=[{"service": "redis", "detail": "连接超时"}],
+            memory_percent=30.0,
+            memory_used_gb=1.0,
+            memory_total_gb=4.0,
+            swap_percent=100.0,
+            swap_used_gb=2.0,
+            swap_total_gb=2.0,
+        )
+        value, text = _build_startup_report(snap)
+        assert "nginx：[UP]" in text
+        assert "redis：[DOWN]（连接超时）" in text
+        assert "app：[SKIP]（未检测到安装痕迹，已自动跳过）" in text
+        assert "内存：30.0%（已用 1.0 / 4.0 GB，swap 100.0%）" in text
+        assert "**汇总**：UP 1 ｜ DOWN 1 ｜ SKIP 1" in text
+        for emoji in "🟢🔴🟡⚠✅❌":
+            assert emoji not in text
+            assert emoji not in value
 
 
 class TestDingTalkSign:

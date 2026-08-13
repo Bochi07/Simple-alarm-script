@@ -23,7 +23,7 @@
 
 | 场景 | 能力 |
 |---|---|
-| 系统资源异常 | 采集 CPU / 内存（含 swap）/ 磁盘 / 负载 / 温度，连续 N 次超阈值分级告警 |
+| 系统资源异常 | 采集 CPU / 内存 / 磁盘 / 负载 / 温度，连续 N 次超阈值分级告警 |
 | 服务挂了没人知道 | 按进程、端口、Unix socket 探测服务存活，DOWN 立即告警，未安装自动跳过 |
 | 关键日志刷屏 | 增量轮询 Nginx / Docker 等日志，命中错误模式聚合推送，联动系统指标给出根因诊断 |
 
@@ -31,7 +31,7 @@
 
 - **指标监控**：CPU（psutil + `/proc` 双通道）、内存、磁盘、负载、温度；
 - **分级阈值**：每个指标独立配置 Warning / Critical 两级，可经环境变量按主机覆盖；
-- **内存含 swap**：内存告警同时看 RAM 与 swap 使用率，swap 打满不会漏报；
+- **内存告警**：仅以总内存（RAM）使用率判定，swap 仅作参考展示、不触发告警；
 - **连续判定防抖**：指标/磁盘连续 N 次（默认 3 次）异常才告警，连续 N 次正常才发恢复，
   偶发毛刺不再单次误报；
 - **负载告警**：load1 按 CPU 核数归一化（load1 / 核数）后分级告警，2 核与 8 核机器不会误报/漏报；
@@ -317,7 +317,7 @@ tail -f ~/.local/state/monitor-agent/alerts.jsonl   # 看留痕（systemd 下在
 | `MONITOR_COMMAND_SHELL` | 空 | 命令型日志使用的 shell（默认自动探测 bash → sh） |
 | `LOG_COMMAND_TIMEOUT` | 15 | 命令型日志单次执行超时（秒） |
 | `CPU_PERCENT_WARNING` / `CPU_PERCENT_CRITICAL` | 80 / 95 | CPU 分级阈值覆盖 |
-| `MEMORY_PERCENT_WARNING` / `MEMORY_PERCENT_CRITICAL` | 80 / 92 | 内存分级阈值覆盖（RAM 与 swap 任一超阈值即告警） |
+| `MEMORY_PERCENT_WARNING` / `MEMORY_PERCENT_CRITICAL` | 80 / 92 | 内存分级阈值覆盖（仅按总内存 RAM 使用率判定） |
 | `DISK_PERCENT_WARNING` / `DISK_PERCENT_CRITICAL` | 80 / 90 | 磁盘分级阈值覆盖 |
 | `TEMPERATURE_C_WARNING` / `TEMPERATURE_C_CRITICAL` | 70 / 85 | 温度分级阈值覆盖 |
 | `LOAD1_WARNING` / `LOAD1_CRITICAL` | 1.0 / 2.0（每核） | 负载分级阈值（load1/核数 归一化后比较） |
