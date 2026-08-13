@@ -242,7 +242,7 @@ async def logwatch_loop(state_store: StateStore) -> None:
                 if not cooldown.allowed(f"log:{code}"):
                     continue
                 samples = group[:config.LOG_ALERT_MAX_SAMPLES]
-                body = f"命中 {len(group)} 条"
+                body = f"**命中详情**\n\n- 命中 {len(group)} 条"
                 if samples:
                     body += "\n\n" + "\n".join(
                         f"- {s['line'][:180]}" for s in samples if s["line"].strip()

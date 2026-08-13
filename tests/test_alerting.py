@@ -251,10 +251,12 @@ class TestMessageRender:
         assert "**级别**：【Warning】" in text
         assert "**主机**：host-1" in text
         assert "**时间**：" in text
-        assert "**指标**：内存使用率（单位 %）" in text
-        assert "**当前值**：内存 85.0%（已用 1.0 / 4.0 GB）" in text
-        assert "**触发阈值**：Warning 80.0% / Critical 92.0%" in text
-        assert "**根因诊断**：内存水位偏高" in text
+        assert "**告警详情**" in text
+        assert "- 指标：内存使用率（单位 %）" in text
+        assert "- 当前值：内存 85.0%（已用 1.0 / 4.0 GB）" in text
+        assert "- 触发阈值：Warning 80.0% / Critical 92.0%" in text
+        assert "**根因诊断**" in text
+        assert "- 内存水位偏高" in text
         assert "**建议措施**" in text
         for emoji in "🟢🔴🟡⚠✅❌":
             assert emoji not in text

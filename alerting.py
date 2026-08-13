@@ -272,17 +272,20 @@ def _sign(url: str, secret: str) -> str:
 def _render_alert(alert: dict) -> tuple[str, str]:
     """渲染告警的 (标题, 正文)，所有通知渠道共用。
 
-    正文左对齐、字段加粗，级别使用【】徽标，状态使用 [UP]/[DOWN]/[SKIP] 文本徽标，
-    全程不使用表情符号；告警 dict 可携带可选字段 body（已排版好的复合内容，如开机
-    播报/SKIP 明细/日志样本），没有 body 时按指标/当前值/触发阈值标准字段渲染。
+    排版与开机状态播报保持一致：分区标题（**xx**）+ 短横线列表、左对齐，
+    级别使用【】徽标，状态使用 [UP]/[DOWN]/[SKIP] 文本徽标，全程不使用表情符号；
+    告警 dict 可携带可选字段 body（已排版好的复合内容，如开机播报/SKIP 明细/
+    日志样本），没有 body 时按指标/当前值/触发阈值标准字段渲染。
     """
     label = _display_metric(alert["metric"])
     if alert["level"] == "Recovery":
         title = f"[恢复] {label} 已恢复正常"
         heading = f"## 恢复 - {label}"
+        detail_title = "**恢复详情**"
     else:
         title = f"[{alert['level']}] 告警 - {label}"
         heading = f"## 告警 - {label}"
+        detail_title = "**告警详情**"
 
     lines = [
         heading, "",
@@ -294,16 +297,16 @@ def _render_alert(alert: dict) -> tuple[str, str]:
     if body:
         lines += ["", body]
     else:
-        lines += [
-            "",
-            f"**指标**：{label}（单位 {alert.get('unit', '-')}）",
-            f"**当前值**：{alert.get('value', '-')}",
-        ]
+        unit = alert.get("unit", "-")
+        unit_part = f"（单位 {unit}）" if unit not in ("-", "") else ""
+        lines += ["", detail_title, ""]
+        lines.append(f"- 指标：{label}{unit_part}")
+        lines.append(f"- 当前值：{alert.get('value', '-')}")
         threshold = alert.get("threshold", "-")
         if threshold != "-":
-            lines.append(f"**触发阈值**：{threshold}")
+            lines.append(f"- 触发阈值：{threshold}")
     if alert.get("diagnosis"):
-        lines += ["", f"**根因诊断**：{alert['diagnosis']}"]
+        lines += ["", "**根因诊断**", "", f"- {alert['diagnosis']}"]
     lines += ["", "**建议措施**", f"> {alert['advice']}"]
     return title, "\n".join(lines)
 
@@ -402,7 +405,7 @@ async def notify_skipped_once(hostname: str, skipped: list[dict], timestamp: str
     if _skip_notified() is not None:
         return False
 
-    body = "\n".join(
+    body = "**跳过明细**\n\n" + "\n".join(
         f"- {s.get('name', '?')}：[SKIP] {s.get('detail', '未检测到安装痕迹，已自动跳过')}"
         for s in skipped
     )
@@ -818,6 +821,7 @@ class AlertEngine:
                 "level": "Critical",
                 "unit": "-",
                 "advice": _OPS_ADVICE["service_down"].format(svc=err["service"]),
+                "diagnosis": "服务存活探测失败（进程/端口/套接字探测未通过）。",
             }
             if self._pass_cooldown(alert):
                 alerts.append(alert)
