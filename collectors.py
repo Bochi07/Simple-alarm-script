@@ -25,7 +25,6 @@ from pathlib import Path
 import psutil
 
 import config
-from config import COLLECT_WORKERS
 
 logger = logging.getLogger("monitor.collect")
 
@@ -36,7 +35,21 @@ THERMAL_ZONE_DIR = Path("/sys/class/thermal")
 
 # 应用自有采集线程池：阻塞采集全部在此执行，不阻塞事件循环；
 # 由 main 在退出时主动有界收尾（避免依赖 asyncio 默认线程池的 300s 等待）。
-EXECUTOR = ThreadPoolExecutor(max_workers=COLLECT_WORKERS, thread_name_prefix="monitor-agent")
+# 注意：线程池 worker 数在进程启动时固定，修改 MONITOR_COLLECT_WORKERS 需重启进程。
+EXECUTOR = ThreadPoolExecutor(max_workers=config.COLLECT_WORKERS, thread_name_prefix="monitor-agent")
+
+_LOCAL_ADDRS: set[str] | None = None
+
+
+def refresh_config() -> None:
+    """SIGHUP 热重载后刷新模块内缓存（本机地址集合等）。
+
+    线程池 worker 数不支持动态调整（ThreadPoolExecutor 限制），
+    修改 MONITOR_COLLECT_WORKERS 需重启进程；其余采集参数均从 config 直读，
+    本身即随热重载生效。
+    """
+    global _LOCAL_ADDRS
+    _LOCAL_ADDRS = None
 
 
 async def await_executor_future(fut):
@@ -315,6 +328,26 @@ def _find_binary(name: str) -> str | None:
     return None
 
 
+def _local_addresses() -> set[str]:
+    """本机地址集合（含回环、主机名与各网卡 IP），用于判断探测目标是否本机。"""
+    global _LOCAL_ADDRS
+    if _LOCAL_ADDRS is None:
+        addrs = {"127.0.0.1", "::1", "localhost", "0.0.0.0", "::", ""}
+        try:
+            hostname = socket.gethostname().lower()
+            addrs.add(hostname)
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                addrs.add(str(info[4][0]).lower())
+        except OSError:
+            pass
+        _LOCAL_ADDRS = addrs
+    return _LOCAL_ADDRS
+
+
+def _is_local_host(host: str) -> bool:
+    return (host or "").strip().lower() in _local_addresses()
+
+
 def _port_has_listener(port: int) -> bool:
     """不建立连接，直接查本机监听表（psutil）；权限不足时返回 False。"""
     try:
@@ -327,8 +360,13 @@ def _port_has_listener(port: int) -> bool:
 
 
 def _tcp_listening(host: str, port: int) -> bool:
-    """TCP 探测：先查监听表（非阻塞、无 socket 副作用），再回退真实连接。"""
-    if _port_has_listener(port):
+    """TCP 探测：本机地址先查监听表（非阻塞、无 socket 副作用），再回退真实连接。
+
+    远端地址（配置了 host 指向其他主机/容器）**必须**真实连接：
+    历史实现无条件先查本机监听表，导致"本机任意进程占用了同号端口"就被判定为服务 UP，
+    远端宕机被漏报。
+    """
+    if _is_local_host(host) and _port_has_listener(port):
         return True
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -359,6 +397,7 @@ def _service_present(svc: dict) -> bool:
     """判断服务在本机是否留有安装痕迹（进程/二进制/socket/监听端口任一）。
 
     用于“配置了服务但主机上根本没部署”的场景：直接判定 SKIP，避免误报 DOWN。
+    端口探测同样遵循 host 语义（远端目标不能用本机监听表冒充）。
     """
     if _process_alive(svc["process_names"]):
         return True
@@ -367,7 +406,9 @@ def _service_present(svc: dict) -> bool:
             return True
     if svc.get("unix_socket") and Path(svc["unix_socket"]).exists():
         return True
-    return bool(svc.get("port") and _port_has_listener(svc["port"]))
+    if svc.get("port"):
+        return _tcp_listening(svc.get("host", "127.0.0.1"), svc["port"])
+    return False
 
 
 def check_service(svc: dict) -> tuple:
@@ -388,17 +429,47 @@ def check_service(svc: dict) -> tuple:
 
 
 # ================= 汇总快照 =================
+_EMPTY_MEM = {
+    "percent": 0.0, "used_gb": 0.0, "total_gb": 0.0,
+    "swap_percent": 0.0, "swap_used_gb": 0.0, "swap_total_gb": 0.0,
+}
+
+
+def _safe(label: str, func, default):
+    """单项采集容错：任何异常只影响该项，不拖垮整轮快照。
+
+    历史实现中 psutil.virtual_memory()/socket.gethostname() 等任意一处抛异常，
+    整个 _collect_sync 就会失败，导致磁盘/负载/温度/服务全部白采且无任何告警。
+    """
+    try:
+        return func()
+    except Exception as exc:
+        logger.warning("%s 采集失败，本轮按默认值处理: %s", label, exc)
+        return default
+
+
 def _collect_sync() -> MetricSnapshot:
-    """同步采集一轮完整指标（在线程池中执行）。"""
-    mem = get_memory_metrics()
-    disks = get_disk_usage_all()
+    """同步采集一轮完整指标（在线程池中执行）；单项失败不影响其余指标。"""
+    mem = _safe("内存", get_memory_metrics, dict(_EMPTY_MEM))
+    if not isinstance(mem, dict):
+        mem = dict(_EMPTY_MEM)
+    for key, value in _EMPTY_MEM.items():
+        mem.setdefault(key, value)
+
+    disks = _safe("磁盘", get_disk_usage_all, [])
+    if not isinstance(disks, list):
+        disks = []
     disk = max(disks, key=lambda d: d["percent"]) if disks else {"percent": 0.0, "used_gb": 0.0, "total_gb": 0.0}
-    load1, load5, load15 = get_loadavg()
-    temperature_c, temperature_source = get_temperature()
+    load = _safe("负载", get_loadavg, (0.0, 0.0, 0.0))
+    try:
+        load1, load5, load15 = load
+    except (TypeError, ValueError):
+        load1, load5, load15 = 0.0, 0.0, 0.0
+    temperature_c, temperature_source = _safe("温度", get_temperature, (-1.0, "none"))
 
     services, service_errors = {}, []
     for svc in config.SERVICES:
-        name = svc["name"]
+        name = svc.get("name", "?") if isinstance(svc, dict) else "?"
         try:
             status, detail = check_service(svc)
         except Exception as exc:
@@ -409,10 +480,10 @@ def _collect_sync() -> MetricSnapshot:
             service_errors.append({"service": name, "detail": detail})
 
     return MetricSnapshot(
-        hostname=socket.gethostname(),
+        hostname=_safe("主机名", socket.gethostname, "unknown"),
         timestamp=utc_now_iso(),
-        cpu_percent=get_cpu_percent(),
-        cpu_percent_proc=get_cpu_percent_from_proc(),
+        cpu_percent=_safe("CPU(psutil)", get_cpu_percent, 0.0),
+        cpu_percent_proc=_safe("CPU(/proc)", get_cpu_percent_from_proc, 0.0),
         memory_percent=mem["percent"],
         memory_used_gb=mem["used_gb"],
         memory_total_gb=mem["total_gb"],

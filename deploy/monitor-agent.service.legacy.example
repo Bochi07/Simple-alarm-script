@@ -17,6 +17,12 @@ Environment=ALERT_STATE_FILE=/var/lib/monitor-agent/alert-state.json
 Environment=SKIP_NOTIFY_FILE=/var/lib/monitor-agent/skip-notified.json
 ExecStartPre=/bin/mkdir -p /run/monitor-agent /var/lib/monitor-agent /var/log/monitor-agent
 ExecStart=__PYTHON_BIN__ __MONITOR_DIR__/main.py
+# 与标准模板同样的问题修复：main.py 单实例锁命中时以退出码 2 正常退出（重复实例），
+# 声明 SuccessExitStatus=2 可避免 Restart=on-failure 把它当成故障而无限重启
+SuccessExitStatus=2
+# 旧版 systemd（< 230）使用 [Service] 段的旧名字限制重启风暴：5 分钟内最多 5 次
+StartLimitInterval=300
+StartLimitBurst=5
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM

@@ -3,6 +3,9 @@ Description=Monitor Agent (metrics + log alerts)
 Documentation=file:__MONITOR_DIR__/README.md
 After=network-online.target
 Wants=network-online.target
+# 重启风暴限制：5 分钟内最多启动 5 次，超出后单元进入 failed 而不是无限重启
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -18,6 +21,9 @@ Environment=ALERT_STATE_FILE=/var/lib/monitor-agent/alert-state.json
 Environment=SKIP_NOTIFY_FILE=/var/lib/monitor-agent/skip-notified.json
 # 安装时由 install.sh 将 __PYTHON_BIN__ / __MONITOR_DIR__ 替换为实际路径
 ExecStart=__PYTHON_BIN__ __MONITOR_DIR__/main.py
+# main.py 的单实例锁命中时（已有实例在运行）会以退出码 2 正常退出；
+# 若不声明 SuccessExitStatus=2，Restart=on-failure 会把“重复实例”误判为故障而无限重启
+SuccessExitStatus=2
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM

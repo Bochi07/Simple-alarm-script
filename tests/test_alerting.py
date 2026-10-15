@@ -182,8 +182,8 @@ class TestAlertEngine:
             alerts = engine.evaluate(make_snapshot(load1=9.0))
         load = [a for a in alerts if a["metric"] == "load1"]
         assert load and load[0]["level"] == "Warning"
-        # value 与 threshold 尺度一致：value 标注归一化值 + 原始值，threshold 为每核阈值
-        assert load[0]["value"] == "1.12x核（原始负载 9.00）"
+        # value 与 threshold 尺度一致：value 标注归一化值 + 原始值 + 归一化基准，threshold 为每核阈值
+        assert load[0]["value"] == "1.12x核（原始负载 9.00，可用 8 核）"
         assert load[0]["threshold"] == "Warning 1.0x核 / Critical 2.0x核"
 
     def test_memory_alert_ignores_swap(self):

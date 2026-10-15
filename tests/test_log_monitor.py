@@ -2,8 +2,17 @@
 from __future__ import annotations
 
 import os
+import shutil
+
+import pytest
 
 from log_monitor import CommandLogWatcher, FileLogWatcher, _resolve_log_path
+
+# 命令型日志依赖 POSIX shell：Windows 上按设计自动跳过（见 README Q14 / 3.1 环境要求）
+requires_posix_shell = pytest.mark.skipif(
+    os.name != "posix" or not (shutil.which("bash") or shutil.which("sh")),
+    reason="需要 POSIX shell，当前平台不支持命令型日志任务",
+)
 
 
 class TestFileLogWatcher:
@@ -47,6 +56,7 @@ class TestFileLogWatcher:
         assert watcher.poll("h") == []
 
 
+@requires_posix_shell
 class TestCommandLogWatcherDiff:
     def test_static_state_triggers_once(self):
         watcher = CommandLogWatcher(

@@ -4,14 +4,15 @@
 特性：
   - Warning / Critical 分级：命中阈值自动升级；
   - 连续判定防抖：指标/磁盘连续 N 次（默认 3，ALERT_CONSECUTIVE）异常才告警，
-    连续 N 次正常才发恢复通知，避免单次毛刺误报；
+    连续 N 次正常才发恢复通知，避免单次毛刺误报；指标回落后连续计数立即归零；
   - 内存告警：仅按总内存（RAM）使用率判定，swap 仅作参考、不参与阈值；
   - 冷却去抖：同指标同级别在冷却期内只推送一次，避免告警风暴；冷却状态持久化，
     进程重启后继续生效，不因重启立刻重复告警；
-  - 恢复通知：指标回落、服务 DOWN->UP/SKIP、日志事件停止出现时，发送“已恢复”通知；
+  - 恢复通知：指标回落、服务 DOWN->UP、日志事件停止出现时，发送“已恢复”通知；
   - 推送可靠性：网络抖动时指数退避重试，仍失败则本地留痕供后续补发；
-  - 告警即服务：每条告警附带时间戳、实际值、阈值、根因诊断与可执行运维建议；
-  - 全部告警落盘 alerts.jsonl 留痕，按大小自动轮转。
+  - 告警即服务：每条告警附带时间戳、实际值、阈值、根因诊断与可执行运维建议，
+    钉钉/企微/飞书消息内附结构化 JSON 段，另支持通用 JSON Webhook 直推结构化告警；
+  - 全部告警落盘 alerts.jsonl 留痕，按大小自动轮转（写入互斥，跨平台安全）。
 """
 from __future__ import annotations
 
@@ -22,33 +23,133 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 import config
 from collectors import MetricSnapshot, await_executor_future, utc_now_iso
-from config import (
-    ALERT_COOLDOWN,
-    ALERT_CONSECUTIVE,
-    ALERT_HISTORY_BACKUPS,
-    ALERT_HISTORY_FILE,
-    ALERT_HISTORY_MAX_BYTES,
-    PUSH_MAX_RETRIES,
-    PUSH_RETRY_BACKOFF,
-    PUSH_TIMEOUT,
-    SKIP_NOTIFY_FILE,
-    SKIP_NOTIFY_ONCE,
-)
 
 logger = logging.getLogger("monitor.alert")
 
 # 进程退出信号：push_alert 的退避等待可被立即打断，
 # 避免“收到 SIGTERM 后仍等完所有重试（最多约 30s）”拖慢退出
 PUSH_ABORT = threading.Event()
+
+# 推送专用线程池：与采集线程池分离，退出时可被有界取消
+PUSH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="monitor-push")
+
+# 留痕写入互斥锁：metrics_loop 与 logwatch_loop 会并发推送，
+# 轮转（rename）与追加（append）必须在同一临界区内，否则留痕可能落进错误代次的备份
+_HISTORY_LOCK = threading.Lock()
+
+# 推送结果三态：静默期只留痕不能被当成“已送达”，否则恢复通知会永久丢失
+PUSH_DELIVERED = "delivered"
+PUSH_SUPPRESSED = "suppressed"
+PUSH_FAILED = "failed"
+
+# 敏感查询串脱敏（避免 access_token / sign / secret 进入日志）
+_SENSITIVE_RE = re.compile(r"((?:access_token|sign|secret|token|key)=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def _sanitize(text) -> str:
+    """日志脱敏：掩码 URL 中的 token / sign / secret 等查询参数。"""
+    return _SENSITIVE_RE.sub(r"\1***", str(text))
+
+
+# ---- 运行时参数（值导入无法跟随 SIGHUP 变化，改由 refresh_config() 同步） ----
+ALERT_COOLDOWN = config.ALERT_COOLDOWN
+ALERT_CONSECUTIVE = config.ALERT_CONSECUTIVE
+ALERT_HISTORY_FILE = config.ALERT_HISTORY_FILE
+ALERT_HISTORY_MAX_BYTES = config.ALERT_HISTORY_MAX_BYTES
+ALERT_HISTORY_BACKUPS = config.ALERT_HISTORY_BACKUPS
+PUSH_TIMEOUT = config.PUSH_TIMEOUT
+PUSH_MAX_RETRIES = config.PUSH_MAX_RETRIES
+PUSH_RETRY_BACKOFF = config.PUSH_RETRY_BACKOFF
+SKIP_NOTIFY_FILE = config.SKIP_NOTIFY_FILE
+SKIP_NOTIFY_ONCE = config.SKIP_NOTIFY_ONCE
+
+
+def refresh_config() -> None:
+    """SIGHUP 热重载后刷新本模块的运行时参数（值导入不会自动跟随 config 变化）。"""
+    global ALERT_COOLDOWN, ALERT_CONSECUTIVE, ALERT_HISTORY_FILE, ALERT_HISTORY_MAX_BYTES
+    global ALERT_HISTORY_BACKUPS, PUSH_TIMEOUT, PUSH_MAX_RETRIES, PUSH_RETRY_BACKOFF
+    global SKIP_NOTIFY_FILE, SKIP_NOTIFY_ONCE, _CPU_CAPACITY
+
+    ALERT_COOLDOWN = config.ALERT_COOLDOWN
+    ALERT_CONSECUTIVE = config.ALERT_CONSECUTIVE
+    ALERT_HISTORY_FILE = config.ALERT_HISTORY_FILE
+    ALERT_HISTORY_MAX_BYTES = config.ALERT_HISTORY_MAX_BYTES
+    ALERT_HISTORY_BACKUPS = config.ALERT_HISTORY_BACKUPS
+    PUSH_TIMEOUT = config.PUSH_TIMEOUT
+    PUSH_MAX_RETRIES = config.PUSH_MAX_RETRIES
+    PUSH_RETRY_BACKOFF = config.PUSH_RETRY_BACKOFF
+    SKIP_NOTIFY_FILE = config.SKIP_NOTIFY_FILE
+    SKIP_NOTIFY_ONCE = config.SKIP_NOTIFY_ONCE
+    _CPU_CAPACITY = None  # 容器限额可能变化，重新探测
+
+
+# ---- CPU 容量探测（cgroup 限额感知，避免容器限核场景负载漏报） ----
+_CPU_CAPACITY: float | None = None
+
+
+def _read_cgroup_cpu_quota() -> float | None:
+    """读取 cgroup CPU 配额（核数）：优先 v2 cpu.max，其次 v1 cfs quota/period。"""
+    candidates = (
+        ("/sys/fs/cgroup/cpu.max", "v2"),
+        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "v1"),
+        ("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us", "v1"),
+    )
+    for path, kind in candidates:
+        try:
+            raw = Path(path).read_text(encoding="utf-8").split()
+        except OSError:
+            continue
+        try:
+            if kind == "v2":
+                if len(raw) != 2 or raw[0] == "max":
+                    continue
+                quota, period = float(raw[0]), float(raw[1])
+                if quota > 0 and period > 0:
+                    return quota / period
+            else:
+                quota = float(raw[0])
+                if quota <= 0:
+                    continue
+                period_path = path.replace("cpu.cfs_quota_us", "cpu.cfs_period_us")
+                period = float(Path(period_path).read_text(encoding="utf-8").strip())
+                if period > 0:
+                    return quota / period
+        except (OSError, ValueError, IndexError):
+            continue
+    return None
+
+
+def cpu_capacity() -> float:
+    """可用 CPU 能力（核数）：cgroup 限额 > CPU 亲和性 > os.cpu_count()。
+
+    `os.cpu_count()` 返回宿主核数，在限核容器里会让 load1 归一化基准偏大，
+    导致负载告警几乎不触发（漏报），因此优先读 cgroup 配额。
+    只有 cgroup 结果被缓存（容器限额在运行时基本不变）；无 cgroup 限额时
+    每次按当前亲和性/cpu_count 计算，保证测试与热重载场景下的取值可预期。
+    """
+    global _CPU_CAPACITY
+    if _CPU_CAPACITY is not None:
+        return _CPU_CAPACITY
+    limit = _read_cgroup_cpu_quota()
+    if limit is not None:
+        _CPU_CAPACITY = max(float(limit), 0.1)
+        return _CPU_CAPACITY
+    try:
+        cores = float(len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError, TypeError):
+        cores = float(os.cpu_count() or 1)
+    return max(cores, 0.1)
 
 # 指标名 -> 快照字段名 映射
 _METRIC_FIELD = {
@@ -116,12 +217,19 @@ class StateStore:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 return data
-        except (OSError, ValueError):
-            pass
+            logger.error("状态文件格式不是 JSON 对象，已忽略: %s", self.path)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            # 静默丢弃会让冷却/级别/服务状态全部归零并重复告警，必须留痕便于排障
+            logger.error("状态文件读取失败，冷却与告警状态将重新开始: %s（%s）", self.path, exc)
         return {}
 
     def get(self, key: str, default=None):
         return self.data.get(key, default)
+
+    def keys(self) -> list[str]:
+        return list(self.data.keys())
 
     def set(self, key: str, value) -> None:
         if self.data.get(key) == value:
@@ -139,10 +247,11 @@ class StateStore:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            payload = json.dumps(self.data, ensure_ascii=False, indent=2) + "\n"
+            with open(tmp, "w", encoding="utf-8") as fp:
+                fp.write(payload)
+                fp.flush()
+                os.fsync(fp.fileno())   # 掉电/panic 时避免留下 0 字节状态
             tmp.replace(self.path)
         except Exception as exc:
             logger.warning("状态持久化写入失败（不影响本轮运行）: %s", exc)
@@ -154,8 +263,8 @@ def _level_for(metric: str, value: float) -> str | None:
     if not rule:
         return None
     if metric == "load1":
-        # 负载按 CPU 核数归一化：load1 / 核数，阈值按“每核负载”定义
-        value = value / max(os.cpu_count() or 1, 1)
+        # 负载按可用 CPU 核数归一化（cgroup 限额感知）：load1 / 核数，阈值按“每核负载”定义
+        value = value / cpu_capacity()
     if value >= rule["critical"]:
         return "Critical"
     if value >= rule["warning"]:
@@ -269,6 +378,28 @@ def _sign(url: str, secret: str) -> str:
     return f"{url}&timestamp={timestamp}&sign={_compute_sign(secret, timestamp)}"
 
 
+def structured_payload(alert: dict) -> dict:
+    """把告警规范化成结构化字段（时间戳 / 实际值 / 阈值 / 诊断 / 可执行建议）。
+
+    同一个结构既用于消息内嵌的 JSON 段，也用于 alerts.jsonl 留痕与通用 JSON Webhook，
+    保证“推送给人的内容”和“机器消费的内容”字段一致。
+    """
+    return {
+        "schema": "monitor-agent/alert/v1",
+        "timestamp": alert.get("timestamp"),
+        "hostname": alert.get("hostname"),
+        "level": alert.get("level"),
+        "metric": alert.get("metric"),
+        "value": alert.get("value"),
+        "threshold": alert.get("threshold"),
+        "unit": alert.get("unit", "-"),
+        "diagnosis": alert.get("diagnosis", ""),
+        "advice": alert.get("advice", ""),
+        "source": "monitor-agent",
+        "version": config.__version__,
+    }
+
+
 def _render_alert(alert: dict) -> tuple[str, str]:
     """渲染告警的 (标题, 正文)，所有通知渠道共用。
 
@@ -276,6 +407,7 @@ def _render_alert(alert: dict) -> tuple[str, str]:
     级别使用【】徽标，状态使用 [UP]/[DOWN]/[SKIP] 文本徽标，全程不使用表情符号；
     告警 dict 可携带可选字段 body（已排版好的复合内容，如开机播报/SKIP 明细/
     日志样本），没有 body 时按指标/当前值/触发阈值标准字段渲染。
+    ALERT_INCLUDE_JSON=1（默认）时在末尾附带结构化 JSON 段。
     """
     label = _display_metric(alert["metric"])
     if alert["level"] == "Recovery":
@@ -308,6 +440,14 @@ def _render_alert(alert: dict) -> tuple[str, str]:
     if alert.get("diagnosis"):
         lines += ["", "**根因诊断**", "", f"- {alert['diagnosis']}"]
     lines += ["", "**建议措施**", f"> {alert['advice']}"]
+    if getattr(config, "ALERT_INCLUDE_JSON", True):
+        payload = structured_payload(alert)
+        lines += [
+            "", "**结构化数据**", "",
+            "```json",
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            "```",
+        ]
     return title, "\n".join(lines)
 
 
@@ -338,6 +478,11 @@ def _payload_feishu(alert: dict) -> str:
     }, ensure_ascii=False)
 
 
+def _payload_json(alert: dict) -> str:
+    """通用 Webhook 载荷：直接 POST 结构化 JSON 告警（便于对接自研平台/二次消费）。"""
+    return json.dumps(structured_payload(alert), ensure_ascii=False)
+
+
 # ================= 告警留痕（jsonl + 大小轮转） =================
 def _rotate_history() -> None:
     """超过大小上限时轮转：alerts.jsonl -> alerts.jsonl.1 -> ... -> .N。"""
@@ -350,19 +495,26 @@ def _rotate_history() -> None:
         if src.exists():
             dst.unlink(missing_ok=True)
             src.rename(dst)
+    # Windows 上 rename 不会覆盖已存在的目标，需先删除，否则该条留痕会丢
+    Path(f"{path}.1").unlink(missing_ok=True)
     path.rename(Path(f"{path}.1"))
 
 
 def _record_alert(alert: dict) -> None:
-    """告警落盘留痕：每行一条结构化 JSON，带大小轮转。"""
+    """告警落盘留痕：每行一条结构化 JSON，带大小轮转。
+
+    写入与轮转在同一把锁内完成，避免两个推送线程并发导致留痕落进错误代次的备份。
+    """
     try:
         path = Path(ALERT_HISTORY_FILE)
         path.parent.mkdir(parents=True, exist_ok=True)
-        _rotate_history()
-        with open(path, "a", encoding="utf-8") as fp:
-            fp.write(json.dumps(alert, ensure_ascii=False) + "\n")
+        line = json.dumps(alert, ensure_ascii=False) + "\n"
+        with _HISTORY_LOCK:
+            _rotate_history()
+            with open(path, "a", encoding="utf-8") as fp:
+                fp.write(line)
     except Exception as exc:
-        logger.warning("告警留痕写入失败: %s", exc)
+        logger.warning("告警留痕写入失败: %s", _sanitize(exc))
 
 
 # ================= SKIP 服务一次性通知 =================
@@ -535,15 +687,29 @@ async def notify_startup_report(snapshot: MetricSnapshot) -> bool:
 
 
 async def _push_in_executor(alert: dict) -> bool:
-    """将阻塞式推送（HTTP + 退避重试）放入线程池，避免阻塞 asyncio 事件循环。"""
+    """将阻塞式推送（HTTP + 退避重试）放入专用线程池，避免阻塞 asyncio 事件循环。
+
+    返回布尔值仅供旧调用点兼容：静默期也视为“已处理”。
+    """
+    status = await _push_status_in_executor(alert)
+    return status in (PUSH_DELIVERED, PUSH_SUPPRESSED)
+
+
+async def _push_status_in_executor(alert: dict) -> str:
+    """异步推送并返回三态结果（delivered / suppressed / failed）。"""
     loop = asyncio.get_running_loop()
-    fut = loop.run_in_executor(None, push_alert, alert)
+    fut = loop.run_in_executor(PUSH_EXECUTOR, push_alert_status, alert)
     return await await_executor_future(fut)
 
 
 async def push_alert_async(alert: dict) -> bool:
     """异步推送单条告警：等价于 push_alert，但不会阻塞事件循环。"""
     return await _push_in_executor(alert)
+
+
+async def push_alert_status_async(alert: dict) -> str:
+    """异步推送单条告警，返回三态结果；静默期返回 suppressed（未真正投递）。"""
+    return await _push_status_in_executor(alert)
 
 
 def _push_once(url: str, body: bytes) -> bool:
@@ -558,7 +724,8 @@ def _push_once(url: str, body: bytes) -> bool:
         },
     )
     with urllib.request.urlopen(req, timeout=PUSH_TIMEOUT) as resp:
-        ret = json.loads(resp.read().decode("utf-8"))
+        # 限制读取长度：避免异常服务端用超大响应体拖住推送线程
+        ret = json.loads(resp.read(65536).decode("utf-8"))
         if isinstance(ret, dict):
             if "errcode" in ret:
                 ok = ret.get("errcode") == 0
@@ -582,44 +749,79 @@ def _silence_active() -> bool:
     return ts is not None and time.time() < ts
 
 
-def push_alert(alert: dict) -> bool:
-    """推送单条告警到配置的通知渠道（指数退避重试）；无渠道或静默期仅本地留痕。"""
-    _record_alert(alert)
-    if _silence_active():
-        logger.info("静默期内（MONITOR_SILENCE_UNTIL），告警仅本地留痕: %s", alert["metric"])
-        return True
-    if config.MONITOR_NOTIFY_STDOUT:
-        title, text = _render_alert(alert)
-        print(f"[{alert['level']}] {title}\n{text}", flush=True)
-        return True
-    if config.WECOM_WEBHOOK:
-        url = config.WECOM_WEBHOOK
-        body = _payload_wecom(alert).encode("utf-8")
-    elif config.FEISHU_WEBHOOK:
-        url = config.FEISHU_WEBHOOK
-        body = _payload_feishu(alert).encode("utf-8")
-    elif config.DINGTALK_WEBHOOK and "REPLACE_ME" not in config.DINGTALK_WEBHOOK:
-        url = _sign(config.DINGTALK_WEBHOOK, config.DINGTALK_SECRET) if config.DINGTALK_SECRET else config.DINGTALK_WEBHOOK
-        body = _build_alert_payload(alert).encode("utf-8")
-    else:
-        logger.warning("未配置通知渠道，已本地留痕（%s）", alert["metric"])
-        return False
+def _alert_silenced(alert: dict) -> bool:
+    """该条告警是否处于静默（全局静默窗口或按服务静默）。"""
+    return _silence_active() or bool(alert.get("silence"))
+
+
+def _push_with_retry(url: str, body: bytes, metric: str) -> bool:
+    """对单个渠道做指数退避重试推送；异常信息脱敏后写日志。"""
     attempt = 0
     while True:
         try:
             if _push_once(url, body):
                 return True
         except Exception as exc:
-            logger.error("通知推送异常(第 %d 次): %s", attempt + 1, exc)
+            logger.error("通知推送异常(第 %d 次): %s", attempt + 1, _sanitize(exc))
         attempt += 1
         if attempt > PUSH_MAX_RETRIES:
-            logger.error("推送失败已达上限，放弃 %s（已留痕，可后续补发）", alert["metric"])
+            logger.error("推送失败已达上限，放弃 %s（已留痕，可后续补发）", metric)
             return False
         backoff = PUSH_RETRY_BACKOFF * (2 ** (attempt - 1))
-        logger.info("%.1fs 后重试推送 %s", backoff, alert["metric"])
+        logger.info("%.1fs 后重试推送 %s", backoff, metric)
         if PUSH_ABORT.wait(timeout=backoff):
-            logger.warning("进程正在退出，放弃剩余重试: %s", alert["metric"])
+            logger.warning("进程正在退出，放弃剩余重试: %s", metric)
             return False
+
+
+def push_alert_status(alert: dict) -> str:
+    """推送单条告警并返回三态结果。
+
+    - delivered：至少一个渠道成功受理（或仅 stdout 输出）；
+    - suppressed：静默期内只留痕、不推送（**不能被上层当成“已送达”**，
+      否则恢复通知会被当作已发送而永久丢失）；
+    - failed：没有可用渠道，或全部渠道推送失败。
+    """
+    _record_alert(alert)
+    if _alert_silenced(alert):
+        logger.info(
+            "静默期内（MONITOR_SILENCE_UNTIL / MONITOR_SILENCE_SERVICES），告警仅本地留痕: %s",
+            alert["metric"],
+        )
+        return PUSH_SUPPRESSED
+    if config.MONITOR_NOTIFY_STDOUT:
+        # stdout 作为**附加**输出（便于 journald/调试），不再短路掉真实 Webhook 渠道
+        title, text = _render_alert(alert)
+        print(f"[{alert['level']}] {title}\n{text}", flush=True)
+
+    targets: list[tuple[str, str]] = []
+    if config.WECOM_WEBHOOK:
+        targets.append((config.WECOM_WEBHOOK, _payload_wecom(alert)))
+    elif config.FEISHU_WEBHOOK:
+        targets.append((config.FEISHU_WEBHOOK, _payload_feishu(alert)))
+    elif config.DINGTALK_WEBHOOK and "REPLACE_ME" not in config.DINGTALK_WEBHOOK:
+        url = _sign(config.DINGTALK_WEBHOOK, config.DINGTALK_SECRET) if config.DINGTALK_SECRET else config.DINGTALK_WEBHOOK
+        targets.append((url, _build_alert_payload(alert)))
+    if config.ALERT_JSON_WEBHOOK:
+        # 通用 JSON Webhook 与聊天渠道并存：人看卡片，机器消费结构化 JSON
+        targets.append((config.ALERT_JSON_WEBHOOK, _payload_json(alert)))
+
+    if not targets:
+        if config.MONITOR_NOTIFY_STDOUT:
+            return PUSH_DELIVERED
+        logger.warning("未配置通知渠道，已本地留痕（%s）", alert["metric"])
+        return PUSH_FAILED
+
+    all_ok = True
+    for url, payload in targets:
+        if not _push_with_retry(url, payload.encode("utf-8"), alert["metric"]):
+            all_ok = False
+    return PUSH_DELIVERED if all_ok else PUSH_FAILED
+
+
+def push_alert(alert: dict) -> bool:
+    """兼容旧签名：delivered / suppressed 均视为“本轮无需重试”。"""
+    return push_alert_status(alert) in (PUSH_DELIVERED, PUSH_SUPPRESSED)
 
 
 # ================= 阈值判定引擎 =================
@@ -646,7 +848,11 @@ class AlertEngine:
 
     # ---- 连续次数判定（指标/磁盘共用） ----
     def _bump_consecutive(self, metric: str) -> bool:
-        """异常样本计数 +1；达到 ALERT_CONSECUTIVE 次返回 True（进入告警判定）。"""
+        """异常样本计数 +1；达到 ALERT_CONSECUTIVE 次返回 True（进入告警判定）。
+
+        计数在样本回落到正常区间时由 evaluate() 归零，因此“连续 N 次”语义对每次
+        异常连击都成立（历史实现只在首次观测时归零，导致首次告警后单样本即告警）。
+        """
         threshold = max(int(ALERT_CONSECUTIVE or 1), 1)
         n = self._consec.get(metric, 0)
         if n >= threshold:
@@ -660,6 +866,17 @@ class AlertEngine:
     def _reset_consecutive(self, metric: str) -> None:
         if self._consec.pop(metric, None) is not None and self._store is not None:
             self._store.delete(f"consec:{metric}")
+
+    @property
+    def pending_confirmation(self) -> bool:
+        """是否存在“越界待确认 / 待恢复”的计数。
+
+        供主循环判断是否把采集周期从常态（默认 60s）临时提速到复核周期（默认 10s），
+        使确认时延不因常态周期变长而退化。
+        """
+        threshold = max(int(ALERT_CONSECUTIVE or 1), 1)
+        counters = list(self._consec.values()) + list(self._normal_consec.values())
+        return any(0 < n < threshold for n in counters)
 
     def _bump_normal(self, metric: str) -> bool:
         """恢复正常样本计数 +1；达到 ALERT_CONSECUTIVE 次返回 True（发送恢复通知）。"""
@@ -706,9 +923,9 @@ class AlertEngine:
             rule = config.THRESHOLDS[metric]
             level = _level_for(metric, value)
             if metric == "load1":
-                cores = max(os.cpu_count() or 1, 1)
+                cores = cpu_capacity()
                 norm = value / cores
-                value_text = f"{norm:.2f}x核（原始负载 {value:.2f}）"
+                value_text = f"{norm:.2f}x核（原始负载 {value:.2f}，可用 {cores:g} 核）"
                 threshold_text = f"Warning {rule['warning']}x核 / Critical {rule['critical']}x核"
             elif metric == "memory_percent":
                 # 仅以总内存（RAM）使用率判定告警；swap 仅作参考展示，不参与阈值判定，
@@ -740,32 +957,35 @@ class AlertEngine:
                 out = self._try_alert(metric, level, prev, alert)
                 if out:
                     alerts.append(out)
-            elif prev in ("Warning", "Critical"):
-                # 指标已回落：连续 N 次正常才发恢复通知，状态迁移等推送确认后再落盘，
-                # 避免“推送失败 -> 状态已记为 ok -> 恢复通知永久丢失”，也避免抖动误恢复。
-                alert = {
-                    "metric": metric,
-                    "hostname": snapshot.hostname,
-                    "timestamp": snapshot.timestamp,
-                    "value": f"{value_text}，已回落至正常范围",
-                    "threshold": threshold_text,
-                    "level": "Recovery",
-                    "unit": rule["unit"],
-                    "advice": "指标已回落至阈值以下，恢复正常。请确认关联业务影响已消除。",
-                    "diagnosis": "指标从告警状态回落至正常水位。",
-                }
-                out = self._try_recovery(metric, alert)
-                if out:
-                    alerts.append(out)
-            elif prev is None:
-                # 首次观测（进程重启后无历史状态）：直接记为正常，避免误发恢复通知
+            else:
+                # 样本回到正常区间：异常连击立即归零，“连续 N 次”对下一次异常重新生效
                 self._reset_consecutive(metric)
-                self._reset_normal(metric)
-                self._last_levels[metric] = "ok"
-                if self._store is not None:
-                    self._store.set(f"metric:{metric}", "ok")
+                if prev in ("Warning", "Critical"):
+                    # 指标已回落：连续 N 次正常才发恢复通知，状态迁移等推送确认后再落盘，
+                    # 避免“推送失败 -> 状态已记为 ok -> 恢复通知永久丢失”，也避免抖动误恢复。
+                    alert = {
+                        "metric": metric,
+                        "hostname": snapshot.hostname,
+                        "timestamp": snapshot.timestamp,
+                        "value": f"{value_text}，已回落至正常范围",
+                        "threshold": threshold_text,
+                        "level": "Recovery",
+                        "unit": rule["unit"],
+                        "advice": "指标已回落至阈值以下，恢复正常。请确认关联业务影响已消除。",
+                        "diagnosis": "指标从告警状态回落至正常水位。",
+                    }
+                    out = self._try_recovery(metric, alert)
+                    if out:
+                        alerts.append(out)
+                elif prev is None:
+                    # 首次观测（进程重启后无历史状态）：直接记为正常，避免误发恢复通知
+                    self._reset_normal(metric)
+                    self._last_levels[metric] = "ok"
+                    if self._store is not None:
+                        self._store.set(f"metric:{metric}", "ok")
 
         # 磁盘多挂载点：每个挂载点独立判定（metric=disk:<path>），消息带挂载点
+        self._prune_disk_state(snapshot)
         for disk in (snapshot.disks or []):
             path = disk["path"]
             pct = float(disk["percent"])
@@ -787,31 +1007,33 @@ class AlertEngine:
                 out = self._try_alert(metric, level, prev, alert)
                 if out:
                     alerts.append(out)
-            elif prev in ("Warning", "Critical"):
-                alert = {
-                    "metric": metric,
-                    "hostname": snapshot.hostname,
-                    "timestamp": snapshot.timestamp,
-                    "value": f"{pct:.1f}%（挂载点 {path}），已回落至正常范围",
-                    "threshold": f"Warning {rule['warning']}% / Critical {rule['critical']}%",
-                    "level": "Recovery",
-                    "unit": "%",
-                    "advice": "磁盘占用已回落至阈值以下，恢复正常。请确认清理效果。",
-                    "diagnosis": f"挂载点 {path} 磁盘占用从告警状态回落至正常水位。",
-                }
-                out = self._try_recovery(metric, alert)
-                if out:
-                    alerts.append(out)
-            elif prev is None:
+            else:
                 self._reset_consecutive(metric)
-                self._reset_normal(metric)
-                self._last_levels[metric] = "ok"
-                if self._store is not None:
-                    self._store.set(f"metric:{metric}", "ok")
+                if prev in ("Warning", "Critical"):
+                    alert = {
+                        "metric": metric,
+                        "hostname": snapshot.hostname,
+                        "timestamp": snapshot.timestamp,
+                        "value": f"{pct:.1f}%（挂载点 {path}），已回落至正常范围",
+                        "threshold": f"Warning {rule['warning']}% / Critical {rule['critical']}%",
+                        "level": "Recovery",
+                        "unit": "%",
+                        "advice": "磁盘占用已回落至阈值以下，恢复正常。请确认清理效果。",
+                        "diagnosis": f"挂载点 {path} 磁盘占用从告警状态回落至正常水位。",
+                    }
+                    out = self._try_recovery(metric, alert)
+                    if out:
+                        alerts.append(out)
+                elif prev is None:
+                    self._reset_normal(metric)
+                    self._last_levels[metric] = "ok"
+                    if self._store is not None:
+                        self._store.set(f"metric:{metric}", "ok")
 
         for err in snapshot.service_errors:
-            if err["service"] in config.SILENCE_SERVICES:
-                continue
+            # 静默服务仍生成告警（只留痕不推送），与 README/配置说明保持一致；
+            # 是否静默由 push_alert_status 依据 alert["silence"] 二次判定。
+            silenced = err["service"] in config.SILENCE_SERVICES
             alert = {
                 "metric": f"service:{err['service']}",
                 "hostname": snapshot.hostname,
@@ -822,16 +1044,38 @@ class AlertEngine:
                 "unit": "-",
                 "advice": _OPS_ADVICE["service_down"].format(svc=err["service"]),
                 "diagnosis": "服务存活探测失败（进程/端口/套接字探测未通过）。",
+                "silence": silenced,
             }
             if self._pass_cooldown(alert):
                 alerts.append(alert)
 
-        # 服务恢复：DOWN -> UP / SKIP 时发送一次恢复通知；状态迁移等推送确认后再落盘
+        # 服务状态迁移：DOWN -> UP 发恢复通知；其余状态迁移立即落盘
         for name, status in snapshot.services.items():
-            if name in config.SILENCE_SERVICES:
-                continue
             prev = self._last_services.get(name)
-            if prev == "DOWN" and status != "DOWN":
+            if status == "SKIP" and prev in ("UP", "DOWN"):
+                # 服务历史上确实存在过（曾 UP/DOWN），此时"探测痕迹消失"更可能是
+                # 进程与端口全部退出、或容器化部署导致宿主无痕迹 —— 一律按 DOWN 处理，
+                # 避免真宕机被降级成 SKIP（漏报），也避免发出误导性的"已恢复"。
+                alert = {
+                    "metric": f"service:{name}",
+                    "hostname": snapshot.hostname,
+                    "timestamp": snapshot.timestamp,
+                    "value": "[DOWN]（探测痕迹消失）",
+                    "threshold": "期望 UP",
+                    "level": "Critical",
+                    "unit": "-",
+                    "advice": _OPS_ADVICE["service_down"].format(svc=name),
+                    "diagnosis": "该服务此前处于 UP/DOWN 状态，本轮进程/端口/套接字痕迹全部消失，"
+                                 "按 DOWN 处理（疑似退出、被卸载或改为容器化部署）。",
+                    "silence": name in config.SILENCE_SERVICES,
+                }
+                if self._pass_cooldown(alert):
+                    alerts.append(alert)
+                self._last_services[name] = "DOWN"
+                if self._store is not None:
+                    self._store.set(f"service:{name}", "DOWN")
+                continue
+            if prev == "DOWN" and status == "UP":
                 alert = {
                     "metric": f"service:{name}",
                     "hostname": snapshot.hostname,
@@ -840,18 +1084,39 @@ class AlertEngine:
                     "threshold": "期望 UP",
                     "level": "Recovery",
                     "unit": "-",
-                    "advice": "服务已从 DOWN 恢复（或判定为未安装自动跳过），请确认状态符合预期。",
-                    "diagnosis": "服务存活探测结果从 DOWN 变为 " + status + "。",
+                    "advice": "服务已从 DOWN 恢复，请确认状态符合预期。",
+                    "diagnosis": "服务存活探测结果从 DOWN 恢复为 UP。",
+                    "silence": name in config.SILENCE_SERVICES,
                 }
                 if self._pass_cooldown(alert):
                     alerts.append(alert)
                 continue
             if prev != status:
-                # 其余状态迁移（首次观测、SKIP->DOWN、UP->DOWN 等）立即落盘
+                # 其余状态迁移（首次观测、UP->DOWN 等）立即落盘
                 self._last_services[name] = status
                 if self._store is not None:
                     self._store.set(f"service:{name}", status)
         return alerts
+
+    def _prune_disk_state(self, snapshot: MetricSnapshot) -> None:
+        """回收已消失挂载点的告警状态键，避免长期运行状态文件无界膨胀。
+
+        仅在本次采集确实拿到了挂载点列表时才回收（采集失败时保持原状态不动）。
+        """
+        disks = snapshot.disks or []
+        if not disks:
+            return
+        current = {f"disk:{d['path']}" for d in disks}
+        known = {m for m in self._last_levels if m.startswith("disk:")}
+        for metric in known - current:
+            self._last_levels.pop(metric, None)
+            self._consec.pop(metric, None)
+            self._normal_consec.pop(metric, None)
+            for level in ("Warning", "Critical", "Recovery"):
+                self._cooldown.clear(f"{metric}:{level}")
+            if self._store is not None:
+                self._store.delete(f"metric:{metric}")
+            logger.info("挂载点已消失，回收其告警状态: %s", metric)
 
     def _pass_cooldown(self, alert: dict) -> bool:
         return self._cooldown.allowed(f"{alert['metric']}:{alert['level']}")
@@ -861,6 +1126,7 @@ class AlertEngine:
 
         恢复通知只有在推送成功后才把指标/服务状态记为“已恢复”，
         推送失败则保持告警状态，下一轮会重新生成恢复通知。
+        静默期（suppressed）不属于送达，主循环不会调用本方法。
         """
         if alert["level"] != "Recovery":
             return
@@ -868,6 +1134,10 @@ class AlertEngine:
         if metric.startswith("service:"):
             name = metric[len("service:"):]
             status = alert["value"]
+            # 状态字段只存原始状态，避免把展示徽标 "[UP]" 写进状态文件
+            status = str(status).strip("[]")
+            if status not in ("UP", "DOWN", "SKIP"):
+                status = "UP"
             self._last_services[name] = status
             if self._store is not None:
                 self._store.set(f"service:{name}", status)
@@ -879,8 +1149,9 @@ class AlertEngine:
             self._last_levels[metric] = "ok"
             if self._store is not None:
                 self._store.set(f"metric:{metric}", "ok")
-        # 恢复通知送达后清零“连续正常”计数，避免后续正常样本重复计次
+        # 恢复通知送达后清零两个方向的连续计数，下一次异常重新需要连续 N 次
         self._reset_normal(metric)
+        self._reset_consecutive(metric)
 
     def forget(self, alert: dict) -> None:
         """推送失败后清冷却，允许下一轮重试。"""
